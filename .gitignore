@@ -1,0 +1,26 @@
+# Go
+/bin/
+*.out
+*.test
+
+# Env
+.env
+
+# Node / Next
+web/node_modules/
+web/.next/
+web/out/
+node_modules/
+
+# Playwright
+e2e/node_modules/
+e2e/test-results/
+e2e/playwright-report/
+e2e/.cache/
+
+# Worktrees
+.claude/worktrees/
+
+# Misc
+*.log
+.DS_Store
