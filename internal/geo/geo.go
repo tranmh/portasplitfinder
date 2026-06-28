@@ -1,9 +1,9 @@
 // Package geo provides German PLZ (postal code) centroid lookups and
 // great-circle distance helpers.
 //
-// TODO: replace internal/geo/data/plz_centroids.csv with the full ~8000-row
-// dataset of all German postal codes. The bundled file is a representative
-// subset covering the mock seed stores plus major German cities.
+// internal/geo/data/plz_centroids.csv holds one centroid per German postal
+// code (~10,800 PLZ), derived from the GeoNames DE postal-code dataset by
+// averaging the coordinates of all places sharing a PLZ.
 package geo
 
 import (

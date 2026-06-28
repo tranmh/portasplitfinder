@@ -9,6 +9,8 @@ It's hot in Germany and everyone wants one. This app tracks availability across
 **eBay**, **guenstiger.de** and **idealo** (shown as "deutschlandweit verfügbar"),
 and emails you when a device becomes available within your chosen radius.
 
+![PortaSplitFinder — map of Germany with availability pins and PLZ filter](./docs/Screenshot.png)
+
 ## Quick start
 
 ```bash
@@ -33,6 +35,8 @@ Then open:
   transitions to in-stock within their PLZ radius.
 - A **Next.js** frontend renders the map (Leaflet + OpenStreetMap), the PLZ
   filter with radius circle, the online-retailer panel, and the subscribe form.
+  PLZ lookups cover every German postal code (~10,800 centroids bundled from the
+  GeoNames DE dataset).
 - **Mailhog** captures outgoing email in development.
 
 Data sources are **mock-first**: a deterministic mock source drives the whole

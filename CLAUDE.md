@@ -106,7 +106,8 @@ Copy `.env.example` → `.env`. Key vars: `DATABASE_URL`, `API_PORT`,
 ## Deferred (not yet built)
 
 Real adapters for eBay (Browse API), idealo, guenstiger, Amazon (next, in that
-rough order); full ~8000-row PLZ dataset (a representative subset is bundled);
-auth/admin; rate-limiting hardening; CI workflow.
+rough order); auth/admin; rate-limiting hardening; CI workflow.
 
 Done: OBI per-market store-level stock (true map pins) — see `internal/source/obi.go`.
+Done: full German PLZ dataset (~10,800 centroids from GeoNames DE) —
+`internal/geo/data/plz_centroids.csv`.
