@@ -71,6 +71,11 @@ services:
         condition: service_healthy
       mailhog:
         condition: service_healthy
+      # Wait for the API to be healthy: it seeds the full source/product/store
+      # catalogue on boot, which the poller's snapshots reference (FK). This makes
+      # the very first poll succeed on a cold, unattended `docker compose up`.
+      api:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/poller", "--healthcheck"]
       interval: 10s
