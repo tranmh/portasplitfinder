@@ -1,0 +1,15 @@
+{
+  "name": "portasplitfinder-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright e2e suite for PortaSplitFinder (runs against the docker-compose stack).",
+  "scripts": {
+    "test": "playwright test",
+    "test:api": "playwright test --project=api",
+    "test:ui": "playwright test --project=ui",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
