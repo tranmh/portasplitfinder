@@ -118,9 +118,11 @@ func (m *MockSource) SeedSources() []domain.Source {
 	return append([]domain.Source{m.Meta()}, m.onlineSourcesMeta()...)
 }
 
-// Fetch implements Source. checkedAt is left zero here; the poller stamps the
-// current time when it writes snapshots, keeping the data deterministic.
-func (m *MockSource) Fetch(_ context.Context) ([]domain.Listing, []domain.Store, error) {
+// Fetch implements Source. The products argument is ignored: the mock keeps its
+// own deterministic catalogue so the seed, poller, and e2e tests all agree.
+// checkedAt is left zero here; the poller stamps the current time when it writes
+// snapshots, keeping the data deterministic.
+func (m *MockSource) Fetch(_ context.Context, _ []domain.Product) ([]domain.Listing, []domain.Store, error) {
 	stores := m.Stores()
 
 	storeURL := func(store, product string) string {

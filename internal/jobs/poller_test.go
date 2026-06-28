@@ -19,6 +19,7 @@ type fakeStore struct {
 	products      map[string]string
 	notifications map[string]bool // subID|dedupeKey
 	statusUpdates int
+	productList   []domain.Product
 }
 
 func key(src, store, prod string) string { return src + "|" + store + "|" + prod }
@@ -32,6 +33,9 @@ func newFakeStore() *fakeStore {
 	}
 }
 
+func (f *fakeStore) ListProducts(context.Context) ([]domain.Product, error) {
+	return f.productList, nil
+}
 func (f *fakeStore) UpsertStore(_ context.Context, s domain.Store) (string, error) {
 	f.stores[s.ID] = s
 	return s.ID, nil

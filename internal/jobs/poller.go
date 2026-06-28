@@ -19,6 +19,7 @@ import (
 // Store is the persistence surface the poller needs. Defined as an interface so
 // the poller can be unit-tested with fakes.
 type Store interface {
+	ListProducts(ctx context.Context) ([]domain.Product, error)
 	UpsertStore(ctx context.Context, s domain.Store) (id string, err error)
 	InsertSnapshot(ctx context.Context, snap domain.AvailabilitySnapshot) error
 	LatestForKey(ctx context.Context, sourceKey, storeID, productID string) (domain.AvailabilitySnapshot, bool, error)
@@ -83,8 +84,15 @@ type transition struct {
 func (p *Poller) PollOnce(ctx context.Context) (mailsSent int, err error) {
 	var transitions []transition
 
+	// Load the tracked products once per cycle and pass them to every source so
+	// real adapters know which items to look up and which ProductID to tag.
+	products, perr := p.store.ListProducts(ctx)
+	if perr != nil {
+		return 0, fmt.Errorf("list products: %w", perr)
+	}
+
 	for _, src := range p.sources {
-		ts, srcErr := p.pollSource(ctx, src)
+		ts, srcErr := p.pollSource(ctx, src, products)
 		if srcErr != nil {
 			p.log.Warn("source poll failed", "source", src.Key(), "err", srcErr)
 			continue
@@ -99,9 +107,9 @@ func (p *Poller) PollOnce(ctx context.Context) (mailsSent int, err error) {
 
 // pollSource fetches one source, writes snapshots, updates status, and returns
 // the listings that transitioned out->in-stock.
-func (p *Poller) pollSource(ctx context.Context, src source.Source) ([]transition, error) {
+func (p *Poller) pollSource(ctx context.Context, src source.Source, products []domain.Product) ([]transition, error) {
 	now := p.now()
-	listings, stores, err := src.Fetch(ctx)
+	listings, stores, err := src.Fetch(ctx, products)
 	if err != nil {
 		if errors.Is(err, source.ErrNotImplemented) {
 			// Stub source: record as ok-but-empty so the loop is tolerant.

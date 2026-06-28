@@ -39,9 +39,11 @@ func TestKnown(t *testing.T) {
 }
 
 func TestStubsReturnNotImplemented(t *testing.T) {
-	for _, k := range []string{"obi", "ebay", "amazon", "guenstiger", "idealo"} {
+	// obi is now a real adapter (tested in obi_test.go); the remaining stubs
+	// still return ErrNotImplemented.
+	for _, k := range []string{"ebay", "amazon", "guenstiger", "idealo"} {
 		srcs, _ := Build([]string{k})
-		_, _, err := srcs[0].Fetch(context.Background())
+		_, _, err := srcs[0].Fetch(context.Background(), nil)
 		if !errors.Is(err, ErrNotImplemented) {
 			t.Errorf("source %q: got err %v, want ErrNotImplemented", k, err)
 		}
@@ -51,11 +53,11 @@ func TestStubsReturnNotImplemented(t *testing.T) {
 func TestMockDeterministic(t *testing.T) {
 	a := NewMockWithTransition(false)
 	b := NewMockWithTransition(false)
-	la, sa, err := a.Fetch(context.Background())
+	la, sa, err := a.Fetch(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lb, sb, _ := b.Fetch(context.Background())
+	lb, sb, _ := b.Fetch(context.Background(), nil)
 	if !reflect.DeepEqual(la, lb) {
 		t.Fatal("mock listings are not deterministic")
 	}
@@ -72,7 +74,7 @@ func TestMockTransitionToggle(t *testing.T) {
 	on := NewMockWithTransition(true)
 
 	findMunich := func(s *MockSource) bool {
-		listings, _, _ := s.Fetch(context.Background())
+		listings, _, _ := s.Fetch(context.Background(), nil)
 		for _, l := range listings {
 			if l.ProductID == MockProductMideaID && l.StoreID != nil && *l.StoreID == mockStoreMunichID {
 				return l.InStock
