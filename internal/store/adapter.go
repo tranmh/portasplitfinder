@@ -49,6 +49,11 @@ func (db *DB) UnsubSubscription(ctx context.Context, token string) (bool, error)
 
 // --- jobs.Store ---
 
+// UpsertSource implements jobs.Store.
+func (db *DB) UpsertSource(ctx context.Context, s domain.Source) error {
+	return db.Sources.Upsert(ctx, s)
+}
+
 // UpsertStore implements jobs.Store.
 func (db *DB) UpsertStore(ctx context.Context, s domain.Store) (string, error) {
 	return db.Stores.Upsert(ctx, s)

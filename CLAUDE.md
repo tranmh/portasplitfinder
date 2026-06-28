@@ -45,10 +45,18 @@ Frontend: `cd web && npm run dev | build | test | lint`.
   matching confirmed subscriptions (deduped). Flags: `--once`, `--healthcheck`.
   Exposes `/healthz`. **Depends on api being healthy** (the api seeds the
   catalogue the poller's snapshots FK-reference).
-- `internal/source` — the pluggable `Source` interface. `mock` provides
-  deterministic seed data driving the whole app; `obi/ebay/amazon/guenstiger/
-  idealo` are stubs (`ErrNotImplemented`) to be filled with real scrapers/APIs.
-  Enabled set comes from the `SOURCES` env var.
+- `internal/source` — the pluggable `Source` interface
+  (`Fetch(ctx, products)` — sources are given the tracked products so they can
+  search and tag listings with the right `ProductID`). `mock` provides
+  deterministic seed data driving the whole app. **`obi` is a real adapter**
+  (scrapes obi.de webshop availability from schema.org `Product` JSON-LD; one
+  online listing per product; degrades gracefully when bot-blocked). `ebay/
+  amazon/guenstiger/idealo` are still stubs (`ErrNotImplemented`). Enabled set
+  comes from `SOURCES` (e.g. `mock,obi`). `internal/source/httpx.go` is the shared
+  HTTP helper (browser UA, backoff, typed `ErrBlocked`) for real adapters.
+- Each source self-registers its catalogue row: the poller upserts `src.Meta()`
+  before writing snapshots, so a real source enabled via `SOURCES` needs no
+  separate seed step.
 - `internal/geo` — embedded PLZ→lat/lon CSV + haversine radius math.
 - `internal/store` — pgx repos, one file per aggregate.
 - See `CODEMAP.md` for a one-line-per-directory map and `docs/api-contract.md`
@@ -86,6 +94,8 @@ Copy `.env.example` → `.env`. Key vars: `DATABASE_URL`, `API_PORT`,
 
 ## Deferred (not yet built)
 
-Real live scrapers + eBay/Amazon API adapters (need keys/approval); full
+Real adapters for eBay (Browse API), idealo, guenstiger, Amazon (next, in that
+rough order); OBI per-market store-level stock (true map pins — needs OBI's
+market-availability endpoint + store directory + bot bypass); full
 ~8000-row PLZ dataset (a representative subset is bundled); auth/admin;
 rate-limiting hardening; CI workflow.

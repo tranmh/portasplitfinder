@@ -20,6 +20,10 @@ import (
 // the poller can be unit-tested with fakes.
 type Store interface {
 	ListProducts(ctx context.Context) ([]domain.Product, error)
+	// UpsertSource ensures a source's catalogue row exists (idempotent; preserves
+	// scrape status). Snapshots FK-reference sources, so this must run before any
+	// snapshot for a newly-enabled real source is written.
+	UpsertSource(ctx context.Context, s domain.Source) error
 	UpsertStore(ctx context.Context, s domain.Store) (id string, err error)
 	InsertSnapshot(ctx context.Context, snap domain.AvailabilitySnapshot) error
 	LatestForKey(ctx context.Context, sourceKey, storeID, productID string) (domain.AvailabilitySnapshot, bool, error)
@@ -109,6 +113,16 @@ func (p *Poller) PollOnce(ctx context.Context) (mailsSent int, err error) {
 // the listings that transitioned out->in-stock.
 func (p *Poller) pollSource(ctx context.Context, src source.Source, products []domain.Product) ([]transition, error) {
 	now := p.now()
+
+	// Ensure the source's own catalogue row exists before writing its snapshots
+	// (snapshots FK-reference sources). Idempotent and status-preserving, so a
+	// real source enabled via SOURCES self-registers without a separate seed step.
+	if err := p.store.UpsertSource(ctx, src.Meta()); err != nil {
+		msg := err.Error()
+		_ = p.store.UpdateSourceStatus(ctx, src.Key(), now, domain.StatusError, &msg)
+		return nil, fmt.Errorf("upsert source %s: %w", src.Key(), err)
+	}
+
 	listings, stores, err := src.Fetch(ctx, products)
 	if err != nil {
 		if errors.Is(err, source.ErrNotImplemented) {

@@ -36,6 +36,10 @@ func newFakeStore() *fakeStore {
 func (f *fakeStore) ListProducts(context.Context) ([]domain.Product, error) {
 	return f.productList, nil
 }
+func (f *fakeStore) UpsertSource(_ context.Context, _ domain.Source) error {
+	return nil
+}
+
 func (f *fakeStore) UpsertStore(_ context.Context, s domain.Store) (string, error) {
 	f.stores[s.ID] = s
 	return s.ID, nil

@@ -146,6 +146,11 @@ Common codes: `validation_error`, `invalid_token`, `not_found`, `rate_limited`,
 - Treat `priceCents: null` as "Preis unbekannt".
 - `online` entries are shown in a side panel as "deutschlandweit verfügbar".
 
+**Sources**
+- `obi` is a real adapter but currently reports **online webshop availability**
+  (obi.de ships nationwide), so its listings have `storeId: null` and appear under
+  `online`, not as map pins. Per-market OBI store stock is a future enhancement.
+
 **Backend**
 - Server is authoritative: validate `plz`/`radius`/`email` server-side regardless of client.
 - `cmd/poller` writes `availability_snapshots`; `/api/availability` reads the latest snapshot per (source, store, product).
