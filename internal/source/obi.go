@@ -8,26 +8,48 @@ import (
 	"math"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 
-	"github.com/PuerkitoBio/goquery"
+	"github.com/google/uuid"
+
 	"github.com/tranmh/portasplitfinder/internal/domain"
+	"github.com/tranmh/portasplitfinder/internal/geo"
 )
 
-// obiSource reports obi.de webshop (online) availability for the tracked
-// products. It resolves each product to an OBI product page, parses the
-// schema.org Product JSON-LD embedded in the page, and emits one online listing
-// (StoreID=nil) per product. Per-market store-level stock is deferred.
+// obiSource reports per-market (store-level) availability of the tracked
+// products across all German OBI markets.
 //
-// OBI is bot-protected: server-side fetches by non-browser clients are commonly
-// rejected (403/404). The httpx client presents a browser User-Agent, and Fetch
-// degrades gracefully when a product is blocked or unparseable: it skips that
-// product and only returns a source-level error if *every* product failed.
+// OBI's webshop does not ship the tracked products to a home address
+// ("Lieferung nach Hause: derzeit nicht möglich") — availability is offered only
+// as reserve & collect in physical markets. So OBI is a store source: Fetch
+// returns one domain.Store per OBI market (with lat/lon) and one listing per
+// market keyed by that store, producing real map pins.
+//
+// It uses two undocumented JSON endpoints that obi.de's own frontend calls:
+//
+//   - store directory (all German markets, with coordinates):
+//     GET /api/disc/store/locator/country/DE
+//   - per-market stock for an article:
+//     GET /api/disc/article-service-proxy/store-specific-articles/v2/DE/de/{storeNumber}?articleNumbers={art}
+//     → [{"storeSpecificArticle":{"price":799.99,"stock":0}, "currency":"EUR", ...}]
+//
+// OBI is bot-protected: the shared httpx Client presents a browser User-Agent.
+// Fetch degrades gracefully — a per-market availability failure skips that
+// market's listing, and a source-level error is returned only if the directory
+// itself fails or every market lookup fails.
 type obiSource struct {
 	client  *Client
 	baseURL string
 }
+
+// obiStoreNamespace seeds deterministic (UUIDv5) store ids derived from a
+// market's OBI store number, so a market keeps the same store id across polls
+// and the in-Fetch listing can reference its store before the poller upserts it.
+var obiStoreNamespace = uuid.MustParse("6f0b9f7e-9b1a-5c2d-8e3f-0a1b2c3d4e5f")
+
+// obiAvailabilityWorkers bounds concurrent per-market availability requests.
+const obiAvailabilityWorkers = 8
 
 // newOBISource builds an obiSource with default browser-like client and base
 // URL. Tests construct obiSource directly to point at an httptest.Server.
@@ -55,25 +77,24 @@ func (s *obiSource) httpClient() *Client {
 // Key implements Source.
 func (s *obiSource) Key() string { return "obi" }
 
-// Meta implements Source. OBI v1 reports nationwide webshop availability, so the
-// type is online (the availability endpoint renders StoreID=nil listings in the
-// online panel keyed by source).
+// Meta implements Source. OBI is a physical store chain: per-market reserve &
+// collect availability renders as map pins.
 func (s *obiSource) Meta() domain.Source {
 	return domain.Source{
 		Key:        "obi",
 		Name:       "OBI",
-		Type:       domain.SourceOnline,
+		Type:       domain.SourceStore,
 		BaseURL:    "https://www.obi.de",
 		LastStatus: domain.StatusNever,
 	}
 }
 
-// knownArticleNos maps a recognised product to its OBI article number. Extend
+// knownObiArticles maps a recognised product to its OBI article number. Extend
 // this small table as more products gain a verified OBI mapping. The Midea
 // PortaSplit (our primary tracked product) is article 8620890.
 var knownObiArticles = []struct {
 	// match reports whether a product is this known item.
-	match    func(p domain.Product) bool
+	match     func(p domain.Product) bool
 	articleNo string
 	slug      string
 }{
@@ -88,298 +109,286 @@ var knownObiArticles = []struct {
 	},
 }
 
-// Fetch implements Source. For each product it resolves an OBI product URL
-// (known mapping first, then search fallback), fetches and parses the page, and
-// emits one online listing. Returns no stores. If every product fails, returns a
-// non-nil error so the poller records the source as errored.
+// Fetch implements Source. It resolves each product to an OBI article number,
+// fetches the German market directory once, then queries per-market stock for
+// every (product, market) pair and emits a store-keyed listing per market.
 func (s *obiSource) Fetch(ctx context.Context, products []domain.Product) ([]domain.Listing, []domain.Store, error) {
-	var listings []domain.Listing
-	var firstErr error
-	attempted := 0
-	failed := 0
-
+	// Resolve the tracked products that have an OBI article number; skip the rest.
+	type tracked struct {
+		product   domain.Product
+		articleNo string
+		pageURL   string
+	}
+	var items []tracked
 	for _, p := range products {
-		attempted++
-		l, err := s.fetchProduct(ctx, p)
+		art, pageURL, err := s.resolveArticle(ctx, p)
 		if err != nil {
-			failed++
-			if firstErr == nil {
-				firstErr = err
-			}
 			continue
 		}
-		listings = append(listings, l)
+		items = append(items, tracked{product: p, articleNo: art, pageURL: pageURL})
+	}
+	if len(items) == 0 {
+		// No tracked product maps to OBI: nothing to do, but not an error.
+		return nil, nil, nil
 	}
 
-	// If we had products but every one failed, surface a source-level error.
-	if attempted > 0 && failed == attempted {
-		return nil, nil, fmt.Errorf("obi: all %d product(s) failed; first error: %w", attempted, firstErr)
+	markets, err := s.fetchMarkets(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("obi: market directory: %w", err)
 	}
-	return listings, nil, nil
+
+	// Build the placeable markets (those we can show on the map) and their stores.
+	type placed struct {
+		storeNo string
+		storeID string
+	}
+	var stores []domain.Store
+	var places []placed
+	for _, m := range markets {
+		if !m.IsActive || m.StoreNumber == "" {
+			continue
+		}
+		lat, lon := m.lat(), m.lon()
+		if lat == 0 && lon == 0 {
+			pt, ok := geo.Lookup(m.zip())
+			if !ok {
+				// Cannot place the market on the map; skip it.
+				continue
+			}
+			lat, lon = pt.Lat, pt.Lon
+		}
+		id := obiStoreID(m.StoreNumber)
+		street := m.street()
+		stores = append(stores, domain.Store{
+			ID:        id,
+			SourceKey: "obi",
+			Name:      "OBI " + m.Name,
+			Street:    &street,
+			PLZ:       m.zip(),
+			City:      m.city(),
+			Lat:       lat,
+			Lon:       lon,
+		})
+		places = append(places, placed{storeNo: m.StoreNumber, storeID: id})
+	}
+	if len(places) == 0 {
+		return nil, nil, errors.New("obi: market directory returned no placeable markets")
+	}
+
+	// Query per-market stock for every (product, market) pair concurrently.
+	type job struct {
+		item  tracked
+		place placed
+	}
+	var jobs []job
+	for _, it := range items {
+		for _, pl := range places {
+			jobs = append(jobs, job{item: it, place: pl})
+		}
+	}
+
+	var (
+		mu       sync.Mutex
+		listings []domain.Listing
+		failures int
+	)
+	sem := make(chan struct{}, obiAvailabilityWorkers)
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		j := j
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			l, err := s.fetchMarketListing(ctx, j.item.product, j.item.articleNo, j.item.pageURL, j.place.storeNo, j.place.storeID)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failures++
+				return
+			}
+			listings = append(listings, l)
+		}()
+	}
+	wg.Wait()
+
+	// Only a total failure (every market lookup failed) is a source-level error.
+	if failures == len(jobs) {
+		return nil, nil, fmt.Errorf("obi: all %d market lookup(s) failed", len(jobs))
+	}
+	return listings, stores, nil
 }
 
-// fetchProduct resolves, fetches, and parses one product.
-func (s *obiSource) fetchProduct(ctx context.Context, p domain.Product) (domain.Listing, error) {
-	pageURL, err := s.resolveURL(ctx, p)
+// fetchMarketListing queries one market's stock for one article and builds a
+// store-keyed listing.
+func (s *obiSource) fetchMarketListing(ctx context.Context, p domain.Product, articleNo, pageURL, storeNo, storeID string) (domain.Listing, error) {
+	body, err := s.httpClient().GetHTML(ctx, s.availabilityURL(storeNo, articleNo))
 	if err != nil {
-		return domain.Listing{}, fmt.Errorf("obi: resolve %q: %w", p.Name, err)
+		return domain.Listing{}, fmt.Errorf("obi: availability store %s: %w", storeNo, err)
 	}
 
-	html, err := s.httpClient().GetHTML(ctx, pageURL)
-	if err != nil {
-		return domain.Listing{}, fmt.Errorf("obi: fetch %s: %w", pageURL, err)
+	var arts []obiArticle
+	if err := json.Unmarshal(body, &arts); err != nil {
+		return domain.Listing{}, fmt.Errorf("obi: decode availability store %s: %w", storeNo, err)
 	}
 
-	prod, err := parseProductJSONLD(html)
-	if err != nil {
-		return domain.Listing{}, fmt.Errorf("obi: parse %s: %w", pageURL, err)
+	var match *obiArticle
+	for i := range arts {
+		if arts[i].ArticleNumber == articleNo {
+			match = &arts[i]
+			break
+		}
 	}
-
+	// A missing article (not carried at this market) counts as out of stock.
+	storeIDCopy := storeID
 	listing := domain.Listing{
 		SourceKey: "obi",
 		ProductID: p.ID,
-		StoreID:   nil,
-		InStock:   prod.inStock,
-		Currency:  prod.currency,
+		StoreID:   &storeIDCopy,
+		Currency:  "EUR",
 		URL:       pageURL,
 	}
-	if prod.priceCents != nil {
-		listing.PriceCents = prod.priceCents
+	if match != nil {
+		if ssa := match.StoreSpecific; ssa != nil {
+			qty := ssa.Stock
+			listing.InStock = ssa.Stock > 0
+			listing.Quantity = &qty
+			if ssa.Price > 0 {
+				cents := int(math.Round(ssa.Price * 100))
+				listing.PriceCents = &cents
+			}
+		}
+		if c := strings.ToUpper(strings.TrimSpace(match.Currency.IsoCode)); c != "" {
+			listing.Currency = c
+		}
 	}
 	return listing, nil
 }
 
-// resolveURL returns the OBI product page URL for p: the known mapping if it
-// matches, otherwise the first product link found on the search results page.
-func (s *obiSource) resolveURL(ctx context.Context, p domain.Product) (string, error) {
+// resolveArticle returns the OBI article number and product page URL for p: the
+// known mapping if it matches, otherwise the first product link on the search
+// results page.
+func (s *obiSource) resolveArticle(ctx context.Context, p domain.Product) (articleNo, pageURL string, err error) {
 	for _, k := range knownObiArticles {
 		if k.match(p) {
-			return fmt.Sprintf("%s/p/%s/%s", s.base(), k.articleNo, k.slug), nil
+			return k.articleNo, fmt.Sprintf("%s/p/%s/%s", s.base(), k.articleNo, k.slug), nil
 		}
 	}
-	return s.searchURL(ctx, p)
+	return s.searchArticle(ctx, p)
 }
 
-// productLinkRe matches an OBI product path: /p/<digits>/<slug>.
+// productLinkRe matches an OBI product path: /p/<digits>/<slug>; group 1 is the
+// article number.
 var productLinkRe = regexp.MustCompile(`/p/(\d+)/[^"'?#\s]+`)
 
-// searchURL fetches the search results page for p.Name and returns the first
-// product link found.
-func (s *obiSource) searchURL(ctx context.Context, p domain.Product) (string, error) {
-	term := url.PathEscape(p.Name)
-	searchURL := fmt.Sprintf("%s/search/%s/", s.base(), term)
-
+// searchArticle fetches the search results page for p.Name and returns the
+// article number and product URL of the first product link found.
+func (s *obiSource) searchArticle(ctx context.Context, p domain.Product) (string, string, error) {
+	searchURL := fmt.Sprintf("%s/search/%s/", s.base(), url.PathEscape(p.Name))
 	html, err := s.httpClient().GetHTML(ctx, searchURL)
 	if err != nil {
-		return "", fmt.Errorf("search: %w", err)
+		return "", "", fmt.Errorf("search %q: %w", p.Name, err)
 	}
+	m := productLinkRe.FindStringSubmatch(string(html))
+	if m == nil {
+		return "", "", fmt.Errorf("search %q: no product link found", p.Name)
+	}
+	return m[1], s.base() + m[0], nil
+}
 
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(html)))
+// fetchMarkets fetches and decodes the German OBI market directory.
+func (s *obiSource) fetchMarkets(ctx context.Context) ([]obiMarket, error) {
+	body, err := s.httpClient().GetHTML(ctx, s.base()+"/api/disc/store/locator/country/DE")
 	if err != nil {
-		return "", fmt.Errorf("search: parse html: %w", err)
+		return nil, err
 	}
-
-	var found string
-	doc.Find(`a[href]`).EachWithBreak(func(_ int, sel *goquery.Selection) bool {
-		href, _ := sel.Attr("href")
-		if m := productLinkRe.FindString(href); m != "" {
-			found = m
-			return false
-		}
-		return true
-	})
-
-	// Fallback: scan raw HTML if no anchor matched (some links are JS-rendered).
-	if found == "" {
-		if m := productLinkRe.FindString(string(html)); m != "" {
-			found = m
-		}
+	var resp obiStoreLocator
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode directory: %w", err)
 	}
-
-	if found == "" {
-		return "", errors.New("search: no product link found")
-	}
-	if strings.HasPrefix(found, "http") {
-		return found, nil
-	}
-	return s.base() + found, nil
+	return resp.Stores, nil
 }
 
-// --- JSON-LD parsing ---
-
-// parsedProduct holds the fields we extract from a schema.org Product offer.
-type parsedProduct struct {
-	inStock    bool
-	priceCents *int
-	currency   string
+// availabilityURL builds the per-market stock endpoint for an article.
+func (s *obiSource) availabilityURL(storeNo, articleNo string) string {
+	return fmt.Sprintf("%s/api/disc/article-service-proxy/store-specific-articles/v2/DE/de/%s?articleNumbers=%s",
+		s.base(), url.PathEscape(storeNo), url.QueryEscape(articleNo))
 }
 
-// ldOffer mirrors the schema.org Offer / AggregateOffer fields we read. price
-// and lowPrice are decoded leniently (they may be a number or a string).
-type ldOffer struct {
-	Type         string      `json:"@type"`
-	Price        json.Number `json:"price"`
-	LowPrice     json.Number `json:"lowPrice"`
-	PriceCurrency string     `json:"priceCurrency"`
-	Availability string      `json:"availability"`
+// obiStoreID returns the deterministic store id for an OBI market number.
+func obiStoreID(storeNo string) string {
+	return uuid.NewSHA1(obiStoreNamespace, []byte("obi:store:"+storeNo)).String()
 }
 
-// ldNode is a single JSON-LD node; offers is decoded separately because it can
-// be an object or an array.
-type ldNode struct {
-	Type   json.RawMessage `json:"@type"`
-	Graph  []ldNode        `json:"@graph"`
-	Offers json.RawMessage `json:"offers"`
+// --- JSON shapes (OBI internal endpoints) ---
+
+// obiStoreLocator is the /store/locator/country/DE response.
+type obiStoreLocator struct {
+	Stores []obiMarket `json:"stores"`
 }
 
-// typeContains reports whether the node's @type (string or array) contains want.
-func (n ldNode) typeContains(want string) bool {
-	if len(n.Type) == 0 {
-		return false
-	}
-	var single string
-	if err := json.Unmarshal(n.Type, &single); err == nil {
-		return single == want
-	}
-	var many []string
-	if err := json.Unmarshal(n.Type, &many); err == nil {
-		for _, t := range many {
-			if t == want {
-				return true
-			}
-		}
-	}
-	return false
+// obiMarket is one OBI market. Address fields appear both at the top level and
+// nested under "address"; accessors prefer the top-level value and fall back to
+// the nested one.
+type obiMarket struct {
+	StoreNumber string         `json:"storeNumber"`
+	Name        string         `json:"name"`
+	Street      string         `json:"street"`
+	Zip         string         `json:"zip"`
+	City        string         `json:"city"`
+	Lat         float64        `json:"lat"`
+	Lon         float64        `json:"lon"`
+	IsActive    bool           `json:"isActive"`
+	Address     obiMarketAddr  `json:"address"`
 }
 
-// parseProductJSONLD extracts the first schema.org Product offer from any
-// application/ld+json block in the page. It handles JSON-LD that is a single
-// object, an array of objects, or wraps nodes in @graph; offers that are an
-// Offer, an AggregateOffer, or an array of offers; and price that is a number or
-// string (using lowPrice when price is absent).
-func parseProductJSONLD(html []byte) (parsedProduct, error) {
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(html)))
-	if err != nil {
-		return parsedProduct{}, fmt.Errorf("parse html: %w", err)
-	}
-
-	var found bool
-	var result parsedProduct
-	doc.Find(`script[type="application/ld+json"]`).EachWithBreak(func(_ int, sel *goquery.Selection) bool {
-		nodes := decodeLDNodes([]byte(sel.Text()))
-		for _, n := range nodes {
-			if !n.typeContains("Product") {
-				continue
-			}
-			offer, ok := pickOffer(n.Offers)
-			if !ok {
-				continue
-			}
-			result = offerToProduct(offer)
-			found = true
-			return false
-		}
-		return true
-	})
-
-	if !found {
-		return parsedProduct{}, errors.New("no schema.org Product offer found")
-	}
-	return result, nil
+type obiMarketAddr struct {
+	Street string  `json:"street"`
+	Zip    string  `json:"zip"`
+	City   string  `json:"city"`
+	Lat    float64 `json:"lat"`
+	Lon    float64 `json:"lon"`
 }
 
-// decodeLDNodes returns all top-level nodes in a JSON-LD block, flattening
-// arrays and @graph wrappers one level.
-func decodeLDNodes(raw []byte) []ldNode {
-	raw = []byte(strings.TrimSpace(string(raw)))
-	if len(raw) == 0 {
-		return nil
-	}
+func (m obiMarket) street() string { return firstNonEmpty(m.Street, m.Address.Street) }
+func (m obiMarket) zip() string    { return firstNonEmpty(m.Zip, m.Address.Zip) }
+func (m obiMarket) city() string   { return firstNonEmpty(m.City, m.Address.City) }
+func (m obiMarket) lat() float64   { return firstNonZero(m.Lat, m.Address.Lat) }
+func (m obiMarket) lon() float64   { return firstNonZero(m.Lon, m.Address.Lon) }
 
-	var out []ldNode
-	// Try a single object first.
-	var single ldNode
-	if err := json.Unmarshal(raw, &single); err == nil {
-		if len(single.Graph) > 0 {
-			out = append(out, single.Graph...)
-		}
-		out = append(out, single)
-		return out
-	}
-	// Try an array of objects.
-	var arr []ldNode
-	if err := json.Unmarshal(raw, &arr); err == nil {
-		for _, n := range arr {
-			if len(n.Graph) > 0 {
-				out = append(out, n.Graph...)
-			}
-			out = append(out, n)
-		}
-		return out
-	}
-	return nil
+// obiArticle is one element of the store-specific-articles response.
+type obiArticle struct {
+	ArticleNumber string            `json:"articleNumber"`
+	Currency      obiCurrency       `json:"currency"`
+	StoreSpecific *obiStoreSpecific `json:"storeSpecificArticle"`
 }
 
-// pickOffer decodes an offers value that may be a single Offer/AggregateOffer or
-// an array of them, returning the first usable one.
-func pickOffer(raw json.RawMessage) (ldOffer, bool) {
-	if len(raw) == 0 {
-		return ldOffer{}, false
-	}
-	var single ldOffer
-	if err := json.Unmarshal(raw, &single); err == nil && (single.Type != "" || single.Price != "" || single.LowPrice != "" || single.Availability != "") {
-		return single, true
-	}
-	var arr []ldOffer
-	if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
-		return arr[0], true
-	}
-	return ldOffer{}, false
+// obiCurrency is the article's currency, e.g. {"isoCode":"EUR","symbol":"€"}.
+type obiCurrency struct {
+	IsoCode string `json:"isoCode"`
+	Symbol  string `json:"symbol"`
 }
 
-// offerToProduct converts a decoded offer to our parsedProduct.
-func offerToProduct(o ldOffer) parsedProduct {
-	cur := strings.ToUpper(strings.TrimSpace(o.PriceCurrency))
-	if cur == "" {
-		cur = "EUR"
-	}
-	p := parsedProduct{
-		inStock:  availabilityInStock(o.Availability),
-		currency: cur,
-	}
+type obiStoreSpecific struct {
+	Price float64 `json:"price"`
+	Stock int     `json:"stock"`
+}
 
-	priceStr := o.Price.String()
-	if priceStr == "" {
-		priceStr = o.LowPrice.String()
-	}
-	if priceStr != "" {
-		if f, err := strconv.ParseFloat(priceStr, 64); err == nil {
-			cents := int(math.Round(f * 100))
-			p.priceCents = &cents
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
-	return p
+	return ""
 }
 
-// availabilityInStock interprets a schema.org availability URL. It treats the
-// product as out-of-stock only for explicit unavailable states; everything else
-// (InStock, InStoreOnly, OnlineOnly, PreOrder, LimitedAvailability, …) counts as
-// available. The scheme (http/https) and trailing path vary, so we match on the
-// final token.
-func availabilityInStock(avail string) bool {
-	a := strings.ToLower(strings.TrimSpace(avail))
-	if a == "" {
-		// No availability stated: assume not in stock to avoid false positives.
-		return false
+func firstNonZero(vals ...float64) float64 {
+	for _, v := range vals {
+		if v != 0 {
+			return v
+		}
 	}
-	// Keep only the final path segment, e.g. ".../InStock" -> "instock".
-	if i := strings.LastIndex(a, "/"); i >= 0 {
-		a = a[i+1:]
-	}
-	switch a {
-	case "outofstock", "soldout", "discontinued", "backorder":
-		return false
-	default:
-		return true
-	}
+	return 0
 }

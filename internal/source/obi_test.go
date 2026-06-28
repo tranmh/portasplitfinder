@@ -2,24 +2,14 @@ package source
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/tranmh/portasplitfinder/internal/domain"
 )
-
-func readFixture(t *testing.T, name string) []byte {
-	t.Helper()
-	b, err := os.ReadFile(filepath.Join("testdata", name))
-	if err != nil {
-		t.Fatalf("read fixture %s: %v", name, err)
-	}
-	return b
-}
 
 // newTestOBI builds an obiSource pointed at srv with a fast no-sleep client.
 func newTestOBI(srv *httptest.Server) *obiSource {
@@ -37,10 +27,50 @@ var mideaProduct = domain.Product{
 	Model: "MAW-12P1",
 }
 
+// directoryJSON is a small OBI market directory covering the placement cases:
+// own coordinates, zero coordinates with a known PLZ (geo fallback), zero
+// coordinates with an unknown PLZ (skipped), and an inactive market (skipped).
+const directoryJSON = `{"stores":[
+ {"storeNumber":"003","name":"Olpe","street":"In der Trift 17","zip":"57462","city":"Olpe","lat":51.0222,"lon":7.8434,"isActive":true,"url":"https://x/markt/olpe"},
+ {"storeNumber":"005","name":"Herford","street":"A 2","zip":"32049","city":"Herford","lat":52.1,"lon":8.6,"isActive":true},
+ {"storeNumber":"100","name":"Failville","street":"B 3","zip":"12345","city":"Failville","lat":50.0,"lon":10.0,"isActive":true},
+ {"storeNumber":"200","name":"Berlin-Mitte","street":"Invalidenstr. 1","zip":"10115","city":"Berlin","lat":0,"lon":0,"isActive":true},
+ {"storeNumber":"300","name":"Nowhere","street":"C 4","zip":"00000","city":"Nowhere","lat":0,"lon":0,"isActive":true},
+ {"storeNumber":"400","name":"Closed","street":"D 5","zip":"99999","city":"Closed","lat":48.0,"lon":11.0,"isActive":false}
+]}`
+
+// availabilityJSON returns a store-specific-articles response for the given
+// stock/price (price 0 => omitted).
+func availabilityJSON(stock int) string {
+	return fmt.Sprintf(`[{"articleNumber":"8620890","currency":{"isoCode":"EUR","symbol":"€"},"name":"Midea PortaSplit","storeSpecificArticle":{"price":799.99,"stock":%d}}]`, stock)
+}
+
+// obiTestHandler serves the directory and per-market availability endpoints.
+// Store 100 returns 404 (a per-market failure); stocks: 003 -> 2, 005 -> 0,
+// 200 -> 1.
+func obiTestHandler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	stocks := map[string]int{"003": 2, "005": 0, "200": 1}
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/disc/store/locator/country/DE":
+			_, _ = w.Write([]byte(directoryJSON))
+		case strings.Contains(r.URL.Path, "/store-specific-articles/v2/"):
+			num := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			if num == "100" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte(availabilityJSON(stocks[num])))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+}
+
 func TestOBI_Meta(t *testing.T) {
-	s := newOBISource()
-	m := s.Meta()
-	if m.Key != "obi" || m.Name != "OBI" || m.Type != domain.SourceOnline {
+	m := newOBISource().Meta()
+	if m.Key != "obi" || m.Name != "OBI" || m.Type != domain.SourceStore {
 		t.Fatalf("unexpected meta: %+v", m)
 	}
 	if m.LastStatus != domain.StatusNever {
@@ -48,12 +78,8 @@ func TestOBI_Meta(t *testing.T) {
 	}
 }
 
-func TestOBI_InStock_KnownMapping(t *testing.T) {
-	var gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		_, _ = w.Write(readFixture(t, "obi_instock.html"))
-	}))
+func TestOBI_PerMarketAvailability(t *testing.T) {
+	srv := httptest.NewServer(obiTestHandler(t))
 	defer srv.Close()
 
 	s := newTestOBI(srv)
@@ -61,168 +87,110 @@ func TestOBI_InStock_KnownMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stores != nil {
-		t.Fatalf("expected nil stores, got %v", stores)
+
+	// Placeable markets: 003, 005, 100, 200 (300 unknown PLZ -> skipped,
+	// 400 inactive -> skipped).
+	if len(stores) != 4 {
+		t.Fatalf("got %d stores, want 4", len(stores))
 	}
-	if len(listings) != 1 {
-		t.Fatalf("got %d listings, want 1", len(listings))
-	}
-	// Known mapping should resolve to the article page without a search request.
-	if !strings.HasPrefix(gotPath, "/p/8620890/") {
-		t.Fatalf("known mapping path = %q, want /p/8620890/...", gotPath)
+	// Store 200 has zero coords in the directory; it should be geocoded from PLZ.
+	for _, st := range stores {
+		if st.SourceKey != "obi" {
+			t.Errorf("store %q SourceKey = %q", st.Name, st.SourceKey)
+		}
+		if st.Lat == 0 || st.Lon == 0 {
+			t.Errorf("store %q has zero coordinates", st.Name)
+		}
+		if !strings.HasPrefix(st.Name, "OBI ") {
+			t.Errorf("store name not prefixed: %q", st.Name)
+		}
 	}
 
-	l := listings[0]
-	if l.SourceKey != "obi" {
-		t.Errorf("SourceKey = %q", l.SourceKey)
+	// Listings: 003, 005, 200 (100 failed with 404 -> skipped).
+	if len(listings) != 3 {
+		t.Fatalf("got %d listings, want 3", len(listings))
 	}
-	if l.ProductID != mideaProduct.ID {
-		t.Errorf("ProductID = %q, want %q", l.ProductID, mideaProduct.ID)
+
+	byStore := map[string]domain.Listing{}
+	for _, l := range listings {
+		if l.SourceKey != "obi" || l.ProductID != mideaProduct.ID {
+			t.Errorf("unexpected listing: %+v", l)
+		}
+		if l.StoreID == nil {
+			t.Fatalf("listing has nil StoreID: %+v", l)
+		}
+		byStore[*l.StoreID] = l
 	}
-	if l.StoreID != nil {
-		t.Errorf("StoreID = %v, want nil", l.StoreID)
+
+	// In-stock market 003: stock 2, price 79999 cents.
+	l003 := byStore[obiStoreID("003")]
+	if !l003.InStock {
+		t.Error("store 003 InStock = false, want true")
 	}
-	if !l.InStock {
-		t.Errorf("InStock = false, want true (InStoreOnly counts as available)")
+	if l003.Quantity == nil || *l003.Quantity != 2 {
+		t.Errorf("store 003 Quantity = %v, want 2", l003.Quantity)
 	}
-	if l.Currency != "EUR" {
-		t.Errorf("Currency = %q", l.Currency)
+	if l003.PriceCents == nil || *l003.PriceCents != 79999 {
+		t.Errorf("store 003 PriceCents = %v, want 79999", l003.PriceCents)
 	}
-	// 799.99 EUR -> 79999 cents
-	if l.PriceCents == nil || *l.PriceCents != 79999 {
-		t.Errorf("PriceCents = %v, want 79999", l.PriceCents)
+	if l003.Currency != "EUR" {
+		t.Errorf("store 003 Currency = %q", l003.Currency)
 	}
-	if !strings.Contains(l.URL, "/p/8620890/") {
-		t.Errorf("URL = %q, want OBI article URL", l.URL)
+
+	// Out-of-stock market 005: stock 0.
+	l005 := byStore[obiStoreID("005")]
+	if l005.InStock {
+		t.Error("store 005 InStock = true, want false")
+	}
+	if l005.Quantity == nil || *l005.Quantity != 0 {
+		t.Errorf("store 005 Quantity = %v, want 0", l005.Quantity)
+	}
+
+	// Every listing's StoreID must reference a returned store.
+	storeIDs := map[string]bool{}
+	for _, st := range stores {
+		storeIDs[st.ID] = true
+	}
+	for _, l := range listings {
+		if !storeIDs[*l.StoreID] {
+			t.Errorf("listing StoreID %q has no matching store", *l.StoreID)
+		}
 	}
 }
 
-func TestOBI_OutOfStock(t *testing.T) {
+func TestOBI_DirectoryFailure_IsSourceError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(readFixture(t, "obi_outofstock.html"))
+		w.WriteHeader(http.StatusNotFound) // OBI blocks the directory
 	}))
 	defer srv.Close()
 
-	l := fetchOne(t, newTestOBI(srv), mideaProduct)
-	if l.InStock {
-		t.Error("InStock = true, want false")
-	}
-	if l.PriceCents == nil || *l.PriceCents != 64900 {
-		t.Errorf("PriceCents = %v, want 64900", l.PriceCents)
-	}
-}
-
-func TestOBI_Graph(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(readFixture(t, "obi_graph.html"))
-	}))
-	defer srv.Close()
-
-	l := fetchOne(t, newTestOBI(srv), mideaProduct)
-	if !l.InStock {
-		t.Error("InStock = false, want true")
-	}
-	if l.PriceCents == nil || *l.PriceCents != 72950 {
-		t.Errorf("PriceCents = %v, want 72950", l.PriceCents)
-	}
-	if l.Currency != "EUR" {
-		t.Errorf("Currency = %q", l.Currency)
-	}
-}
-
-func TestOBI_AggregateOffer_LowPrice(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(readFixture(t, "obi_aggregate.html"))
-	}))
-	defer srv.Close()
-
-	l := fetchOne(t, newTestOBI(srv), mideaProduct)
-	if !l.InStock {
-		t.Error("InStock = false, want true")
-	}
-	// lowPrice 559.99 -> 55999 cents
-	if l.PriceCents == nil || *l.PriceCents != 55999 {
-		t.Errorf("PriceCents = %v, want 55999 (lowPrice)", l.PriceCents)
-	}
-}
-
-func TestOBI_Blocked_SkipsProduct(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound) // OBI blocks -> 404
-	}))
-	defer srv.Close()
-
-	s := newTestOBI(srv)
-	listings, _, err := s.Fetch(context.Background(), []domain.Product{mideaProduct})
-	// Single product, it failed -> source-level error returned.
+	_, _, err := newTestOBI(srv).Fetch(context.Background(), []domain.Product{mideaProduct})
 	if err == nil {
-		t.Fatal("expected source-level error when all products fail")
+		t.Fatal("expected a source-level error when the directory fails")
+	}
+}
+
+func TestOBI_AllMarketsFail_IsSourceError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/disc/store/locator/country/DE" {
+			_, _ = w.Write([]byte(directoryJSON))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound) // every availability lookup fails
+	}))
+	defer srv.Close()
+
+	listings, _, err := newTestOBI(srv).Fetch(context.Background(), []domain.Product{mideaProduct})
+	if err == nil {
+		t.Fatal("expected a source-level error when every market lookup fails")
 	}
 	if len(listings) != 0 {
 		t.Fatalf("got %d listings, want 0", len(listings))
 	}
 }
 
-func TestOBI_PartialFailure_KeepsGoing(t *testing.T) {
-	// Known product (mapped path) succeeds; an unknown product's search 404s.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/p/8620890/") {
-			_, _ = w.Write(readFixture(t, "obi_instock.html"))
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-
-	unknown := domain.Product{ID: "x", Name: "Nonexistent Gadget 5000", Model: "NG-5000"}
-	s := newTestOBI(srv)
-	listings, _, err := s.Fetch(context.Background(), []domain.Product{mideaProduct, unknown})
-	if err != nil {
-		t.Fatalf("partial failure should not be a source error, got %v", err)
-	}
-	if len(listings) != 1 {
-		t.Fatalf("got %d listings, want 1 (the known product)", len(listings))
-	}
-	if listings[0].ProductID != mideaProduct.ID {
-		t.Errorf("kept wrong product: %q", listings[0].ProductID)
-	}
-}
-
-func TestOBI_SearchFallback(t *testing.T) {
-	var sawSearch bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasPrefix(r.URL.Path, "/search/"):
-			sawSearch = true
-			_, _ = w.Write(readFixture(t, "obi_search.html"))
-		case strings.HasPrefix(r.URL.Path, "/p/9999004/"):
-			_, _ = w.Write(readFixture(t, "obi_search_product.html"))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-
-	// Unknown product -> search fallback -> first /p/ link -> product page.
-	unknown := domain.Product{ID: "p-search", Name: "Klimageraet", Model: ""}
-	l := fetchOne(t, newTestOBI(srv), unknown)
-	if !sawSearch {
-		t.Fatal("expected a search request")
-	}
-	if l.ProductID != "p-search" {
-		t.Errorf("ProductID = %q", l.ProductID)
-	}
-	if !strings.Contains(l.URL, "/p/9999004/") {
-		t.Errorf("resolved URL = %q, want the first search result", l.URL)
-	}
-	if l.PriceCents == nil || *l.PriceCents != 39999 {
-		t.Errorf("PriceCents = %v, want 39999", l.PriceCents)
-	}
-}
-
 func TestOBI_EmptyProducts_NoError(t *testing.T) {
-	s := newOBISource()
-	listings, stores, err := s.Fetch(context.Background(), nil)
+	listings, stores, err := newOBISource().Fetch(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("empty products should not error, got %v", err)
 	}
@@ -231,35 +199,78 @@ func TestOBI_EmptyProducts_NoError(t *testing.T) {
 	}
 }
 
-func TestAvailabilityInStock(t *testing.T) {
-	cases := map[string]bool{
-		"http://schema.org/InStock":             true,
-		"https://schema.org/InStock":            true,
-		"http://schema.org/InStoreOnly":         true,
-		"https://schema.org/OnlineOnly":         true,
-		"https://schema.org/PreOrder":           true,
-		"https://schema.org/LimitedAvailability": true,
-		"http://schema.org/OutOfStock":          false,
-		"https://schema.org/SoldOut":            false,
-		"https://schema.org/Discontinued":       false,
-		"":                                      false,
-	}
-	for in, want := range cases {
-		if got := availabilityInStock(in); got != want {
-			t.Errorf("availabilityInStock(%q) = %v, want %v", in, got, want)
+func TestOBI_UnmappableProduct_NoError(t *testing.T) {
+	// An unknown product whose search finds no OBI link is skipped (no error),
+	// and with no mappable products Fetch never touches the directory.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/search/") {
+			_, _ = w.Write([]byte("<html>no products here</html>"))
+			return
 		}
+		t.Errorf("unexpected request to %s", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	unknown := domain.Product{ID: "x", Name: "Nonexistent Gadget 5000", Model: "NG-5000"}
+	listings, stores, err := newTestOBI(srv).Fetch(context.Background(), []domain.Product{unknown})
+	if err != nil {
+		t.Fatalf("unmappable product should not error, got %v", err)
+	}
+	if len(listings) != 0 || stores != nil {
+		t.Fatalf("expected no listings/stores, got %v / %v", listings, stores)
 	}
 }
 
-// fetchOne fetches a single product and asserts exactly one listing.
-func fetchOne(t *testing.T, s *obiSource, p domain.Product) domain.Listing {
-	t.Helper()
-	listings, _, err := s.Fetch(context.Background(), []domain.Product{p})
+func TestOBI_SearchFallback_ResolvesArticle(t *testing.T) {
+	var sawSearch bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/search/"):
+			sawSearch = true
+			_, _ = w.Write([]byte(`<a href="/p/9999004/klimageraet-xy">Klimagerät</a>`))
+		case r.URL.Path == "/api/disc/store/locator/country/DE":
+			_, _ = w.Write([]byte(directoryJSON))
+		case strings.Contains(r.URL.Path, "/store-specific-articles/v2/"):
+			// The resolved article (9999004) is queried for each market.
+			if !strings.Contains(r.URL.RawQuery, "9999004") {
+				t.Errorf("availability query = %q, want article 9999004", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`[{"articleNumber":"9999004","currency":{"isoCode":"EUR","symbol":"€"},"storeSpecificArticle":{"price":399.99,"stock":5}}]`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	unknown := domain.Product{ID: "p-search", Name: "Klimageraet", Model: ""}
+	listings, _, err := newTestOBI(srv).Fetch(context.Background(), []domain.Product{unknown})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listings) != 1 {
-		t.Fatalf("got %d listings, want 1", len(listings))
+	if !sawSearch {
+		t.Fatal("expected a search request")
 	}
-	return listings[0]
+	if len(listings) == 0 {
+		t.Fatal("expected listings from the resolved article")
+	}
+	l := listings[0]
+	if l.ProductID != "p-search" {
+		t.Errorf("ProductID = %q", l.ProductID)
+	}
+	if !strings.Contains(l.URL, "/p/9999004/") {
+		t.Errorf("listing URL = %q, want the resolved product page", l.URL)
+	}
+	if l.PriceCents == nil || *l.PriceCents != 39999 {
+		t.Errorf("PriceCents = %v, want 39999", l.PriceCents)
+	}
+}
+
+func TestOBI_StoreID_Deterministic(t *testing.T) {
+	if a, b := obiStoreID("003"), obiStoreID("003"); a != b {
+		t.Fatalf("store id not deterministic: %q != %q", a, b)
+	}
+	if obiStoreID("003") == obiStoreID("005") {
+		t.Fatal("distinct markets share a store id")
+	}
 }

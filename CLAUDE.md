@@ -48,12 +48,23 @@ Frontend: `cd web && npm run dev | build | test | lint`.
 - `internal/source` — the pluggable `Source` interface
   (`Fetch(ctx, products)` — sources are given the tracked products so they can
   search and tag listings with the right `ProductID`). `mock` provides
-  deterministic seed data driving the whole app. **`obi` is a real adapter**
-  (scrapes obi.de webshop availability from schema.org `Product` JSON-LD; one
-  online listing per product; degrades gracefully when bot-blocked). `ebay/
-  amazon/guenstiger/idealo` are still stubs (`ErrNotImplemented`). Enabled set
-  comes from `SOURCES` (e.g. `mock,obi`). `internal/source/httpx.go` is the shared
-  HTTP helper (browser UA, backoff, typed `ErrBlocked`) for real adapters.
+  deterministic seed data driving the whole app. **`obi` is a real
+  per-market store adapter** (`Type=store`): OBI's webshop does not ship the
+  tracked products home, so availability is reserve & collect only. It fetches
+  the German market directory
+  (`/api/disc/store/locator/country/DE` → ~357 markets with lat/lon), then
+  queries per-market stock for each tracked article
+  (`/api/disc/article-service-proxy/store-specific-articles/v2/DE/de/{storeNumber}?articleNumbers=…`
+  → `storeSpecificArticle.stock`/`price`), emitting one store-keyed listing per
+  market (real map pins). Store ids are deterministic UUIDv5 from the OBI store
+  number. It degrades gracefully when bot-blocked (per-market failures are
+  skipped; a source-level error is returned only if the directory or *every*
+  market lookup fails). Note: one availability request per market per tracked
+  product per poll (~357 at default `POLL_INTERVAL=5m`, bursted with bounded
+  concurrency). `ebay/amazon/guenstiger/idealo` are still stubs
+  (`ErrNotImplemented`). Enabled set comes from `SOURCES` (e.g. `mock,obi`).
+  `internal/source/httpx.go` is the shared HTTP helper (browser UA, backoff,
+  typed `ErrBlocked`) for real adapters.
 - Each source self-registers its catalogue row: the poller upserts `src.Meta()`
   before writing snapshots, so a real source enabled via `SOURCES` needs no
   separate seed step.
@@ -95,7 +106,7 @@ Copy `.env.example` → `.env`. Key vars: `DATABASE_URL`, `API_PORT`,
 ## Deferred (not yet built)
 
 Real adapters for eBay (Browse API), idealo, guenstiger, Amazon (next, in that
-rough order); OBI per-market store-level stock (true map pins — needs OBI's
-market-availability endpoint + store directory + bot bypass); full
-~8000-row PLZ dataset (a representative subset is bundled); auth/admin;
-rate-limiting hardening; CI workflow.
+rough order); full ~8000-row PLZ dataset (a representative subset is bundled);
+auth/admin; rate-limiting hardening; CI workflow.
+
+Done: OBI per-market store-level stock (true map pins) — see `internal/source/obi.go`.
