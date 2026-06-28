@@ -22,9 +22,12 @@ type Source interface {
 	// Meta returns the source's catalogue metadata.
 	Meta() domain.Source
 	// Fetch returns the current listings and (for store sources) the stores they
-	// belong to. Implementations must be safe to call concurrently with respect
-	// to other sources.
-	Fetch(ctx context.Context) ([]domain.Listing, []domain.Store, error)
+	// belong to, for the given tracked products. Implementations may use the
+	// products to resolve which items to look up and which ProductID to tag on
+	// each listing; the mock source ignores them and uses its own catalogue.
+	// Implementations must be safe to call concurrently with respect to other
+	// sources.
+	Fetch(ctx context.Context, products []domain.Product) ([]domain.Listing, []domain.Store, error)
 }
 
 // builder constructs a source instance.
@@ -33,7 +36,7 @@ type builder func() Source
 // builders is the registry of all known source keys.
 var builders = map[string]builder{
 	"mock":       func() Source { return NewMock() },
-	"obi":        func() Source { return &obiSource{} },
+	"obi":        func() Source { return newOBISource() },
 	"ebay":       func() Source { return &ebaySource{} },
 	"amazon":     func() Source { return &amazonSource{} },
 	"guenstiger": func() Source { return &guenstigerSource{} },
