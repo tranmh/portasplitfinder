@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-slate-50 text-slate-900 antialiased;
+}
+
+/* Tint the PLZ-center marker so it stands out from store markers. */
+.psf-center-marker {
+  filter: hue-rotate(140deg) saturate(1.4);
+}
+
+/* Ensure the Leaflet container always has a real height. */
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+}
