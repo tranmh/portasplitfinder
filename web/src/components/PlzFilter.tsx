@@ -12,6 +12,7 @@ export interface PlzFilterValue {
 
 export interface PlzFilterProps {
   messages: Messages;
+  defaultPlz?: string;
   defaultRadius?: number;
   debounceMs?: number;
   /** Fires (debounced) with a valid 5-digit PLZ + radius, or empty PLZ to clear. */
@@ -20,12 +21,13 @@ export interface PlzFilterProps {
 
 export function PlzFilter({
   messages,
+  defaultPlz = "",
   defaultRadius = 50,
   debounceMs = 400,
   onChange,
 }: PlzFilterProps) {
   const t = messages.filter;
-  const [plz, setPlz] = useState("");
+  const [plz, setPlz] = useState(defaultPlz);
   const [radius, setRadius] = useState(defaultRadius);
 
   const debouncedPlz = useDebouncedValue(plz, debounceMs);

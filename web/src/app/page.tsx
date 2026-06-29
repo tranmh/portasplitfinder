@@ -12,9 +12,14 @@ import { formatDateTime } from "@/lib/format";
 
 const messages = getMessages(DEFAULT_LOCALE);
 
+/** Default filter: PLZ 73035 (Göppingen), 50 km radius. */
+const DEFAULT_PLZ = "73035";
+const DEFAULT_RADIUS_KM = 50;
+
 export default function HomePage() {
-  const [plz, setPlz] = useState("");
-  const [radius, setRadius] = useState(50);
+  const [plz, setPlz] = useState(DEFAULT_PLZ);
+  const [radius, setRadius] = useState(DEFAULT_RADIUS_KM);
+  const [inStockOnly, setInStockOnly] = useState(false);
 
   const handleFilterChange = useCallback((value: PlzFilterValue) => {
     setPlz(value.plz);
@@ -24,7 +29,10 @@ export default function HomePage() {
   const { data, loading, error, refetch } = useAvailability(plz, radius);
 
   const center = data?.center ?? null;
-  const stores = data?.stores ?? [];
+  const allStores = data?.stores ?? [];
+  const stores = inStockOnly
+    ? allStores.filter((s) => s.listings.some((l) => l.inStock))
+    : allStores;
   const online = data?.online ?? [];
   const radiusKm = data?.radiusKm ?? radius;
   const generatedAt = formatDateTime(data?.generatedAt ?? null);
@@ -39,7 +47,22 @@ export default function HomePage() {
       <div className="grid gap-6 lg:grid-cols-[360px_1fr]">
         {/* Left column: filter + lists + subscribe */}
         <div className="space-y-6">
-          <PlzFilter messages={messages} onChange={handleFilterChange} />
+          <PlzFilter
+            messages={messages}
+            defaultPlz={DEFAULT_PLZ}
+            defaultRadius={DEFAULT_RADIUS_KM}
+            onChange={handleFilterChange}
+          />
+
+          <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white p-4 text-sm font-medium text-slate-700 shadow-sm">
+            <input
+              type="checkbox"
+              checked={inStockOnly}
+              onChange={(e) => setInStockOnly(e.target.checked)}
+              className="h-4 w-4 rounded border-slate-300 accent-sky-600"
+            />
+            {messages.filter.inStockOnly}
+          </label>
 
           {error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 p-4">

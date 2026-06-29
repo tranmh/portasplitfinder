@@ -12,6 +12,7 @@ export const en: Messages = {
     radiusLabel: "Radius",
     radiusUnit: "km",
     reset: "Reset",
+    inStockOnly: "Show only stores with availability",
   },
 
   map: {

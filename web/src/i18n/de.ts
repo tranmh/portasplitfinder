@@ -10,6 +10,7 @@ export const de = {
     radiusLabel: "Umkreis",
     radiusUnit: "km",
     reset: "Zurücksetzen",
+    inStockOnly: "Nur Märkte mit Verfügbarkeit anzeigen",
   },
 
   map: {
