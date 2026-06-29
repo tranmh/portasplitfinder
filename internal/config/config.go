@@ -25,6 +25,12 @@ type Config struct {
 
 	Sources []string
 
+	// UnblockerURL, when set, is a web-unblocker API URL template (containing the
+	// placeholder "{{url}}") that real source adapters route requests through to
+	// get past bot protection (e.g. Cloudflare on bauhaus.info). Empty = adapters
+	// fetch directly and degrade gracefully when blocked.
+	UnblockerURL string
+
 	PollInterval     time.Duration
 	PollerHealthPort int
 }
@@ -34,13 +40,14 @@ type Config struct {
 // typed value cannot be parsed.
 func Load() (Config, error) {
 	c := Config{
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		PublicBaseURL:    getEnv("PUBLIC_BASE_URL", "http://localhost:8080"),
-		SMTPHost:         getEnv("SMTP_HOST", "mailhog"),
-		SMTPUsername:     os.Getenv("SMTP_USERNAME"),
-		SMTPPassword:     os.Getenv("SMTP_PASSWORD"),
-		SMTPFrom:         getEnv("SMTP_FROM", "PortaSplitFinder <noreply@portasplitfinder.local>"),
-		Sources:          parseSources(getEnv("SOURCES", "mock")),
+		DatabaseURL:   os.Getenv("DATABASE_URL"),
+		PublicBaseURL: getEnv("PUBLIC_BASE_URL", "http://localhost:8080"),
+		SMTPHost:      getEnv("SMTP_HOST", "mailhog"),
+		SMTPUsername:  os.Getenv("SMTP_USERNAME"),
+		SMTPPassword:  os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:      getEnv("SMTP_FROM", "PortaSplitFinder <noreply@portasplitfinder.local>"),
+		Sources:       parseSources(getEnv("SOURCES", "mock")),
+		UnblockerURL:  getEnv("UNBLOCKER_URL", ""),
 	}
 
 	var err error

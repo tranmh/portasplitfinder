@@ -8,12 +8,15 @@ import (
 func TestLoad_Defaults(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x/y")
 	// Ensure optional vars are unset.
-	for _, k := range []string{"API_PORT", "SMTP_PORT", "POLLER_HEALTH_PORT", "POLL_INTERVAL", "SMTP_TLS", "SOURCES", "PUBLIC_BASE_URL"} {
+	for _, k := range []string{"API_PORT", "SMTP_PORT", "POLLER_HEALTH_PORT", "POLL_INTERVAL", "SMTP_TLS", "SOURCES", "PUBLIC_BASE_URL", "UNBLOCKER_URL"} {
 		t.Setenv(k, "")
 	}
 	c, err := Load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.UnblockerURL != "" {
+		t.Errorf("UnblockerURL = %q, want empty by default", c.UnblockerURL)
 	}
 	if c.APIPort != 8080 {
 		t.Errorf("APIPort = %d, want 8080", c.APIPort)
@@ -41,9 +44,13 @@ func TestLoad_Overrides(t *testing.T) {
 	t.Setenv("POLL_INTERVAL", "30s")
 	t.Setenv("SMTP_TLS", "true")
 	t.Setenv("SOURCES", "mock, obi ,amazon")
+	t.Setenv("UNBLOCKER_URL", "https://app.scrapingbee.com/api/v1/?api_key=k&url={{url}}")
 	c, err := Load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.UnblockerURL != "https://app.scrapingbee.com/api/v1/?api_key=k&url={{url}}" {
+		t.Errorf("UnblockerURL = %q", c.UnblockerURL)
 	}
 	if c.APIPort != 9000 {
 		t.Errorf("APIPort = %d", c.APIPort)

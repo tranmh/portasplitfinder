@@ -21,6 +21,17 @@ func TestBuild_Enabled(t *testing.T) {
 	}
 }
 
+func TestBuild_MockObiBauhaus(t *testing.T) {
+	srcs, err := Build([]string{"mock", "obi", "bauhaus"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{srcs[0].Key(), srcs[1].Key(), srcs[2].Key()}
+	if !reflect.DeepEqual(keys, []string{"mock", "obi", "bauhaus"}) {
+		t.Fatalf("order not preserved: %v", keys)
+	}
+}
+
 func TestBuild_Unknown(t *testing.T) {
 	if _, err := Build([]string{"nope"}); err == nil {
 		t.Fatal("expected error for unknown source")
@@ -28,7 +39,7 @@ func TestBuild_Unknown(t *testing.T) {
 }
 
 func TestKnown(t *testing.T) {
-	for _, k := range []string{"mock", "obi", "ebay", "amazon", "guenstiger", "idealo"} {
+	for _, k := range []string{"mock", "obi", "bauhaus", "ebay", "amazon", "guenstiger", "idealo"} {
 		if !Known(k) {
 			t.Errorf("expected %q to be known", k)
 		}

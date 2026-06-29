@@ -30,6 +30,17 @@ type Source interface {
 	Fetch(ctx context.Context, products []domain.Product) ([]domain.Listing, []domain.Store, error)
 }
 
+// unblockerTemplate is the process-wide web-unblocker URL template (see
+// WithUnblocker) applied to real adapters' HTTP clients. Empty = direct fetch.
+// Set once at startup via SetUnblocker before Build.
+var unblockerTemplate string
+
+// SetUnblocker configures the web-unblocker URL template that real source
+// adapters (obi, bauhaus) route their requests through. Call once at startup
+// (e.g. from the poller) before building sources. An empty template means the
+// adapters fetch directly and degrade gracefully when bot-blocked.
+func SetUnblocker(template string) { unblockerTemplate = template }
+
 // builder constructs a source instance.
 type builder func() Source
 
@@ -37,6 +48,7 @@ type builder func() Source
 var builders = map[string]builder{
 	"mock":       func() Source { return NewMock() },
 	"obi":        func() Source { return newOBISource() },
+	"bauhaus":    func() Source { return newBauhausSource() },
 	"ebay":       func() Source { return &ebaySource{} },
 	"amazon":     func() Source { return &amazonSource{} },
 	"guenstiger": func() Source { return &guenstigerSource{} },

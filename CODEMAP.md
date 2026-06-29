@@ -9,7 +9,7 @@ for the API spec.
 - `cmd/poller/` — scheduled scrape + notify loop; `/healthz`; flags `--once`/`--healthcheck`. Has its `Dockerfile`.
 - `internal/domain/` — shared structs + enums mirroring the API contract.
 - `internal/config/` — env parsing (`Load()`).
-- `internal/source/` — pluggable `Source` interface; `mock` (deterministic seed) + `obi/ebay/amazon/guenstiger/idealo` stubs; registry built from `SOURCES`.
+- `internal/source/` — pluggable `Source` interface; `mock` (deterministic seed) + real per-market store adapters `obi` and `bauhaus` (true map pins; `bauhaus` is scoped to 50 km around PLZ 73035 and fetches via an optional web-unblocker — `httpx.WithUnblocker`/`UNBLOCKER_URL` — degrading gracefully on Cloudflare 403) + `ebay/amazon/guenstiger/idealo` stubs; registry built from `SOURCES`.
 - `internal/geo/` — embedded PLZ-centroid CSV (`data/plz_centroids.csv`), haversine `DistanceKm`, `Lookup`, `WithinRadius`.
 - `internal/store/` — pgx/pgxpool repositories (one file per aggregate), embedded-migration runner, seed.
 - `internal/jobs/` — the poller: snapshots, transition detection, notification matching + dedupe; `LastPoll` for `/healthz`.

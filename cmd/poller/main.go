@@ -54,6 +54,9 @@ func main() {
 	}
 	defer db.Close()
 
+	// Configure the web-unblocker transport (if any) before building real sources.
+	source.SetUnblocker(cfg.UnblockerURL)
+
 	srcs, err := source.Build(cfg.Sources)
 	if err != nil {
 		log.Error("build sources", "err", err)

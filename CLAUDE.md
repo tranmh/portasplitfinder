@@ -61,10 +61,31 @@ Frontend: `cd web && npm run dev | build | test | lint`.
   skipped; a source-level error is returned only if the directory or *every*
   market lookup fails). Note: one availability request per market per tracked
   product per poll (~357 at default `POLL_INTERVAL=5m`, bursted with bounded
-  concurrency). `ebay/amazon/guenstiger/idealo` are still stubs
-  (`ErrNotImplemented`). Enabled set comes from `SOURCES` (e.g. `mock,obi`).
+  concurrency). **`bauhaus` is a second real per-market store adapter**
+  (`Type=store`), mirroring OBI: it fetches the German BAUHAUS Fachcentren
+  directory (`/api/stores-search` → stores with `geolocation` lat/lon), then
+  queries per-store reserve & collect availability for each tracked SKU
+  (`/api/product-availability/availability-detail/{sku}?storeId=…&searchRadius=100`
+  → `availabilityMap.reservation.state`/`price`), emitting one store-keyed
+  listing per Fachcentrum (real map pins). Store ids are deterministic UUIDv5
+  from the BAUHAUS store number (own namespace, distinct from OBI). BAUHAUS is
+  scoped to Fachcentren within **50 km of PLZ 73035** (`bauhausAnchorPLZ`/
+  `bauhausRadiusKm`, via `geo.WithinRadius`) to keep per-poll request volume (and
+  web-unblocker cost) small, with low concurrency (2 workers). BAUHAUS is behind
+  **Cloudflare Bot Management**: a managed JS challenge + per-IP WAF that —
+  empirically — defeats both browser-TLS impersonation and a headless browser
+  from a single IP. So live data requires routing through a **web-unblocker**
+  (see `UNBLOCKER_URL` / `httpx.WithUnblocker`). Without one it degrades
+  gracefully (httpx maps 403 → `ErrBlocked`; per-store failures are skipped; a
+  source-level error only on directory/all-stores failure).
+  `ebay/amazon/guenstiger/idealo` are still stubs
+  (`ErrNotImplemented`). Enabled set comes from `SOURCES` (e.g. `mock,obi` or
+  `mock,obi,bauhaus`).
   `internal/source/httpx.go` is the shared HTTP helper (browser UA, backoff,
-  typed `ErrBlocked`) for real adapters.
+  typed `ErrBlocked`) for real adapters. When `UNBLOCKER_URL` is set,
+  `WithUnblocker` routes every real-adapter request through that web-unblocker
+  API (a URL template with a `{{url}}` placeholder); `source.SetUnblocker` wires
+  it in from config at poller startup.
 - Each source self-registers its catalogue row: the poller upserts `src.Meta()`
   before writing snapshots, so a real source enabled via `SOURCES` needs no
   separate seed step.
@@ -101,13 +122,22 @@ Frontend: `cd web && npm run dev | build | test | lint`.
 
 Copy `.env.example` → `.env`. Key vars: `DATABASE_URL`, `API_PORT`,
 `PUBLIC_BASE_URL` (used to build email confirm/unsub links),
-`NEXT_PUBLIC_API_BASE_URL`, `SMTP_*`, `SOURCES` (e.g. `mock`), `POLL_INTERVAL`.
+`NEXT_PUBLIC_API_BASE_URL`, `SMTP_*`, `SOURCES` (e.g. `mock`), `POLL_INTERVAL`,
+`UNBLOCKER_URL` (web-unblocker template for real adapters; empty = direct fetch).
 
 ## Deferred (not yet built)
 
 Real adapters for eBay (Browse API), idealo, guenstiger, Amazon (next, in that
 rough order); auth/admin; rate-limiting hardening; CI workflow.
+**BAUHAUS live data needs a web-unblocker key.** The adapter + the `UNBLOCKER_URL`
+transport are built and tested, but BAUHAUS's Cloudflare protection (managed JS
+challenge + per-IP WAF) was empirically shown to beat browser-TLS impersonation
+and a headless browser from a single IP, so real pins require a commercial
+web-unblocker (ScrapingBee/ZenRows/etc.) — drop a key into `UNBLOCKER_URL`.
+Without it, `bauhaus` degrades to `ErrBlocked` and the app keeps working.
 
 Done: OBI per-market store-level stock (true map pins) — see `internal/source/obi.go`.
+Done: BAUHAUS per-market store-level stock (true map pins, Cloudflare-403
+graceful degradation) — see `internal/source/bauhaus.go`.
 Done: full German PLZ dataset (~10,800 centroids from GeoNames DE) —
 `internal/geo/data/plz_centroids.csv`.
