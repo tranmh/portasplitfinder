@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -34,6 +36,12 @@ type Client struct {
 	// baseBackoff is the first backoff interval; each retry doubles it. Set to 0
 	// in tests to avoid real sleeps.
 	baseBackoff time.Duration
+	// unblocker, when non-empty, is a provider-agnostic web-unblocker URL template
+	// containing the literal placeholder "{{url}}". Each request's target URL is
+	// URL-encoded and substituted in, so the GET goes to the unblocker (which
+	// solves Cloudflare/bot protection from a residential-proxy pool) instead of
+	// the target directly. Empty = fetch the target directly.
+	unblocker string
 }
 
 // ClientOption configures a Client.
@@ -64,6 +72,22 @@ func WithBaseBackoff(d time.Duration) ClientOption {
 // WithHTTPClient overrides the underlying *http.Client (tests).
 func WithHTTPClient(hc *http.Client) ClientOption {
 	return func(c *Client) { c.hc = hc }
+}
+
+// WithUnblocker routes every request through a web-unblocker API. template is a
+// URL containing the literal placeholder "{{url}}"; the target URL is
+// URL-encoded and substituted in. An empty template is a no-op (direct fetch).
+func WithUnblocker(template string) ClientOption {
+	return func(c *Client) { c.unblocker = template }
+}
+
+// applyUnblocker rewrites target through the unblocker template, or returns
+// target unchanged when no template is configured.
+func applyUnblocker(template, target string) string {
+	if template == "" {
+		return target
+	}
+	return strings.Replace(template, "{{url}}", url.QueryEscape(target), 1)
 }
 
 // NewClient builds a Client with browser-like defaults.
@@ -122,7 +146,8 @@ func (c *Client) GetHTML(ctx context.Context, url string) ([]byte, error) {
 // try performs a single request. retryable reports whether the error is worth
 // retrying (5xx or transport/timeout).
 func (c *Client) try(ctx context.Context, url string) (body []byte, retryable bool, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	fetchURL := applyUnblocker(c.unblocker, url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 	if err != nil {
 		return nil, false, err
 	}

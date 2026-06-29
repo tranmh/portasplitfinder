@@ -100,6 +100,57 @@ func TestClient_BlockedStatuses(t *testing.T) {
 	}
 }
 
+func TestClient_Unblocker_RewritesURL(t *testing.T) {
+	const target = "https://www.bauhaus.info/api/stores-search?storeId=520"
+	var gotTarget string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The client should call the unblocker with the target URL-encoded into ?u=.
+		gotTarget = r.URL.Query().Get("u")
+		_, _ = w.Write([]byte(`{"stores":[]}`))
+	}))
+	defer srv.Close()
+
+	tmpl := srv.URL + "/v1/?api_key=k&premium_proxy=true&u={{url}}"
+	body, err := testClient(WithUnblocker(tmpl)).GetHTML(context.Background(), target)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if gotTarget != target {
+		t.Errorf("unblocker received target %q, want %q", gotTarget, target)
+	}
+	if string(body) != `{"stores":[]}` {
+		t.Errorf("body = %q, want the unblocked target body", body)
+	}
+}
+
+func TestClient_NoUnblocker_FetchesDirect(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	if _, err := testClient().GetHTML(context.Background(), srv.URL+"/api/stores-search"); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/api/stores-search" {
+		t.Errorf("direct fetch path = %q, want /api/stores-search", gotPath)
+	}
+}
+
+func TestClient_Unblocker_403StillBlocked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden) // unblocker itself returns blocked
+	}))
+	defer srv.Close()
+
+	_, err := testClient(WithUnblocker(srv.URL+"/?u={{url}}")).GetHTML(context.Background(), "https://www.bauhaus.info/x")
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("got %v, want ErrBlocked", err)
+	}
+}
+
 func TestClient_ContextCancel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

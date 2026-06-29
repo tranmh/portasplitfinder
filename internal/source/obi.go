@@ -55,7 +55,7 @@ const obiAvailabilityWorkers = 8
 // URL. Tests construct obiSource directly to point at an httptest.Server.
 func newOBISource() *obiSource {
 	return &obiSource{
-		client:  NewClient(),
+		client:  NewClient(WithUnblocker(unblockerTemplate)),
 		baseURL: "https://www.obi.de",
 	}
 }
@@ -332,15 +332,15 @@ type obiStoreLocator struct {
 // nested under "address"; accessors prefer the top-level value and fall back to
 // the nested one.
 type obiMarket struct {
-	StoreNumber string         `json:"storeNumber"`
-	Name        string         `json:"name"`
-	Street      string         `json:"street"`
-	Zip         string         `json:"zip"`
-	City        string         `json:"city"`
-	Lat         float64        `json:"lat"`
-	Lon         float64        `json:"lon"`
-	IsActive    bool           `json:"isActive"`
-	Address     obiMarketAddr  `json:"address"`
+	StoreNumber string        `json:"storeNumber"`
+	Name        string        `json:"name"`
+	Street      string        `json:"street"`
+	Zip         string        `json:"zip"`
+	City        string        `json:"city"`
+	Lat         float64       `json:"lat"`
+	Lon         float64       `json:"lon"`
+	IsActive    bool          `json:"isActive"`
+	Address     obiMarketAddr `json:"address"`
 }
 
 type obiMarketAddr struct {
