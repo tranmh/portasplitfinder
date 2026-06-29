@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -44,6 +45,41 @@ func Open(ctx context.Context, databaseURL string) (*DB, error) {
 		Subscriptions: &SubscriptionRepo{pool: pool},
 		Notifications: &NotificationRepo{pool: pool},
 	}, nil
+}
+
+// WaitReady blocks until the database accepts a connection (open + ping) or
+// maxWait elapses, retrying with bounded backoff. It makes startup resilient to
+// transient failures — Docker's embedded DNS not yet resolving the `db` service,
+// or Postgres still finishing boot — so a single hiccup no longer kills the
+// process before Migrate/Open run. Returns the last error on timeout, or the
+// context error if ctx is cancelled.
+func WaitReady(ctx context.Context, databaseURL string, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		pool, err := pgxpool.New(ctx, databaseURL)
+		if err == nil {
+			err = pool.Ping(ctx)
+			pool.Close()
+		}
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		delay := time.Duration(attempt+1) * 500 * time.Millisecond
+		if delay > 3*time.Second {
+			delay = 3 * time.Second
+		}
+		if time.Now().Add(delay).After(deadline) {
+			return fmt.Errorf("store: db not ready after %s: %w", maxWait, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 }
 
 // Close releases the underlying pool.

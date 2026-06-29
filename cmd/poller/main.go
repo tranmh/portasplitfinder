@@ -41,6 +41,13 @@ func main() {
 	ctx, cancel := signalContext()
 	defer cancel()
 
+	// Tolerate a slow/late database on boot (Postgres still starting, Docker
+	// embedded DNS not yet resolving `db`) so a transient hiccup doesn't kill us.
+	if err := store.WaitReady(ctx, cfg.DatabaseURL, 60*time.Second); err != nil {
+		log.Error("wait for db", "err", err)
+		os.Exit(1)
+	}
+
 	// Ensure schema exists (poller may start before/independently of api).
 	if err := store.Migrate(ctx, cfg.DatabaseURL); err != nil {
 		log.Error("migrate", "err", err)
