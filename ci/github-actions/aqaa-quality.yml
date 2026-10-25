@@ -1,0 +1,255 @@
+# The safety net of portasplitfinder, written by aqaa from what its QA run found:
+# unit tests with coverage and its floor, integration tests against the databases they need, end-to-end tests,
+# lint, SAST and dependency audits (report only until the findings are triaged; SARIF goes to code scanning).
+# Actions are pinned to commit SHAs (the comment names the release); jobs get read-only tokens.
+name: aqaa quality
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  unit-go:
+    name: Unit tests (go)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install dependencies
+        run: |-
+          mkdir -p test-reports
+          go mod download
+      - name: Unit tests
+        run: go run gotest.tools/gotestsum@v1.13.0 --format testname --junitfile test-reports/unit.xml -- -count=1 -covermode=atomic -coverpkg=./... -coverprofile=test-reports/coverage.out ./...
+      - name: Coverage floor (58%)
+        run: python3 "$GITHUB_WORKSPACE/ci/coverage_gate.py" gocover 'test-reports/coverage.out' 58
+      - if: always()
+        name: Upload test reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-go
+          path: test-reports
+          if-no-files-found: ignore
+          retention-days: 14
+  integration-go:
+    name: Integration tests (go)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aqaa
+          POSTGRES_PASSWORD: aqaa
+          POSTGRES_DB: aqaa
+        ports: ['5432:5432']
+        options: "--health-cmd \"pg_isready -U aqaa -d aqaa\" --health-interval 2s --health-timeout 5s --health-retries 30"
+    env:
+      AQAA_PG_URL: postgres://aqaa:aqaa@localhost:5432/aqaa?sslmode=disable
+      AQAA_PG_CONNECTION_STRING: Host=localhost;Port=5432;Database=aqaa;Username=aqaa;Password=aqaa
+      DATABASE_URL: postgres://aqaa:aqaa@localhost:5432/aqaa?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install dependencies
+        run: |-
+          mkdir -p test-reports
+          go mod download
+      - name: Integration tests
+        run: RUN_INTEGRATION=1 INTEGRATION=1 go run gotest.tools/gotestsum@v1.13.0 --format testname --junitfile test-reports/integration.xml -- -count=1 -tags integration -run Integration ./...
+      - if: always()
+        name: Upload test reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-go
+          path: test-reports
+          if-no-files-found: ignore
+          retention-days: 14
+  checks-go:
+    name: Static analysis (go)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Install dependencies
+        run: |-
+          mkdir -p test-reports
+          go mod download
+      - name: go vet (lint, report only)
+        run: go vet ./...
+        continue-on-error: true
+      - name: golangci-lint (lint, report only)
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run --output.text.path stdout --output.sarif.path test-reports/golangci.sarif ./...
+        continue-on-error: true
+      - if: always() && hashFiles('test-reports/golangci.sarif') != ''
+        continue-on-error: true
+        name: Upload golangci-lint findings to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: test-reports/golangci.sarif
+          category: golangci-lint-go
+      - name: govulncheck (dependency, report only)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        continue-on-error: true
+  unit-nextjs-web:
+    name: Unit tests (nextjs web)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: |- # zizmor: ignore[adhoc-packages] test tooling, pinned to exact versions
+          mkdir -p test-reports
+          npm ci
+          npm install --no-save --no-audit --no-fund "@vitest/coverage-v8@$(node -p "require('vitest/package.json').version")"
+      - name: Unit tests
+        run: npx vitest run --coverage --coverage.reporter=cobertura --coverage.reportsDirectory=test-reports/coverage --reporter=default --reporter=junit --outputFile.junit=test-reports/unit.xml --exclude '**/*.integration.test.*' --exclude 'e2e/**'
+      - name: Coverage floor (92%)
+        run: python3 "$GITHUB_WORKSPACE/ci/coverage_gate.py" cobertura 'test-reports/coverage/cobertura-coverage.xml' 92
+      - if: always()
+        name: Upload test reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-nextjs-web
+          path: web/test-reports
+          if-no-files-found: ignore
+          retention-days: 14
+  checks-nextjs-web:
+    name: Static analysis (nextjs web)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: |- # zizmor: ignore[adhoc-packages] test tooling, pinned to exact versions
+          mkdir -p test-reports
+          npm ci
+          npm install --no-save --no-audit --no-fund "@vitest/coverage-v8@$(node -p "require('vitest/package.json').version")"
+      - name: eslint (lint, report only)
+        run: if ls eslint.config.* .eslintrc* >/dev/null 2>&1; then npx eslint .; else echo 'no ESLint configuration'; fi
+        continue-on-error: true
+      - name: tsc (lint, report only)
+        run: npx tsc --noEmit
+        continue-on-error: true
+      - name: npm audit (dependency, report only)
+        run: npm audit --audit-level=high --omit=dev
+        continue-on-error: true
+  e2e-node-e2e:
+    name: End-to-end tests (node e2e)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - name: Install dependencies
+        run: |-
+          mkdir -p test-reports
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: End-to-end tests
+        run: PLAYWRIGHT_JUNIT_OUTPUT_NAME=test-reports/e2e.xml npx playwright test --reporter=junit,list
+      - if: always()
+        name: Upload test reports
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-node-e2e
+          path: e2e/test-reports
+          if-no-files-found: ignore
+          retention-days: 14
+  checks-node-e2e:
+    name: Static analysis (node e2e)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - name: Install dependencies
+        run: |-
+          mkdir -p test-reports
+          npm ci
+      - name: eslint (lint, report only)
+        run: if ls eslint.config.* .eslintrc* >/dev/null 2>&1; then npx eslint .; else echo 'no ESLint configuration'; fi
+        continue-on-error: true
+      - name: npm audit (dependency, report only)
+        run: npm audit --audit-level=high --omit=dev
+        continue-on-error: true
