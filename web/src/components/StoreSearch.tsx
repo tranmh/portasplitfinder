@@ -18,19 +18,22 @@ export function StoreSearch({ messages, plz }: StoreSearchProps) {
   const [results, setResults] = useState<StoreAvailability[] | null>(null);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
+  // The term of the search whose results are shown; load more pages through it.
+  const [query, setQuery] = useState("");
   const [error, setError] = useState(false);
 
-  async function load(nextPage: number) {
+  async function load(q: string, nextPage: number) {
     setError(false);
     try {
       const res = await searchStores({
-        q: term.trim(),
+        q,
         plz: isValidPlz(plz) ? plz.trim() : undefined,
         page: nextPage,
       });
       setResults((prev) => (nextPage === 1 || !prev ? res.stores : [...prev, ...res.stores]));
       setTotal(res.total);
       setPage(nextPage);
+      setQuery(q);
     } catch {
       setError(true);
     }
@@ -38,7 +41,7 @@ export function StoreSearch({ messages, plz }: StoreSearchProps) {
 
   function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    void load(1);
+    void load(term.trim(), 1);
   }
 
   return (
@@ -105,7 +108,7 @@ export function StoreSearch({ messages, plz }: StoreSearchProps) {
           {results.length < total && (
             <button
               type="button"
-              onClick={() => void load(page + 1)}
+              onClick={() => void load(query, page + 1)}
               className="mt-3 text-sm font-medium text-sky-700 underline hover:text-sky-900"
             >
               {t.loadMore}

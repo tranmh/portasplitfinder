@@ -1,0 +1,42 @@
+-- Shared seed data for the pgTAP tests.
+-- Include it inside a test transaction (after BEGIN, before plan) with:
+--   \i test/pgtap/seeds/seed.psql
+-- All ids and timestamps are fixed so tests can refer to them directly.
+-- Rows roll back with the test transaction.
+
+-- products
+INSERT INTO products (id, name, model, image_url, created_at) VALUES
+    ('00000000-0000-0000-0000-000000000101', 'Raspberry Pi 5', '8GB',  'https://example.test/pi5-8.png', '2026-01-01T00:00:00Z'),
+    ('00000000-0000-0000-0000-000000000102', 'Raspberry Pi 5', '4GB',  NULL,                             '2026-01-01T00:00:00Z');
+
+-- sources: one online shop, one store chain, one never checked
+INSERT INTO sources (key, name, type, base_url, last_checked_at, last_status, last_error) VALUES
+    ('shop-a',  'Shop A',  'online', 'https://shop-a.example.test',  '2026-01-02T10:00:00Z', 'ok',    NULL),
+    ('chain-b', 'Chain B', 'store',  'https://chain-b.example.test', '2026-01-02T10:00:00Z', 'error', 'HTTP 503'),
+    ('chain-c', 'Chain C', 'store',  'https://chain-c.example.test', NULL,                   'never', NULL);
+
+-- stores (Esslingen 73035 and Stuttgart nearby, Köln far away)
+INSERT INTO stores (id, source_key, name, street, plz, city, lat, lon) VALUES
+    ('00000000-0000-0000-0000-000000000201', 'chain-b', 'Chain B Esslingen', 'Bahnhofstr. 1', '73035', 'Esslingen', 48.7406, 9.3108),
+    ('00000000-0000-0000-0000-000000000202', 'chain-b', 'Chain B Stuttgart', 'Königstr. 10',  '70173', 'Stuttgart', 48.7758, 9.1829),
+    ('00000000-0000-0000-0000-000000000203', 'chain-c', 'Chain C Köln',      NULL,            '50667', 'Köln',      50.9375, 6.9603);
+
+-- availability snapshots: older and newer for the same key, online (store_id NULL) and store rows
+INSERT INTO availability_snapshots (id, source_key, store_id, product_id, in_stock, quantity, price_cents, currency, url, checked_at) VALUES
+    ('00000000-0000-0000-0000-000000000301', 'shop-a',  NULL,                                   '00000000-0000-0000-0000-000000000101', false, NULL, 9490, 'EUR', 'https://shop-a.example.test/pi5-8', '2026-01-02T09:00:00Z'),
+    ('00000000-0000-0000-0000-000000000302', 'shop-a',  NULL,                                   '00000000-0000-0000-0000-000000000101', true,  NULL, 9490, 'EUR', 'https://shop-a.example.test/pi5-8', '2026-01-02T10:00:00Z'),
+    ('00000000-0000-0000-0000-000000000303', 'chain-b', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000101', true,  3,    9990, 'EUR', 'https://chain-b.example.test/p/1', '2026-01-02T10:00:00Z'),
+    ('00000000-0000-0000-0000-000000000304', 'chain-b', '00000000-0000-0000-0000-000000000202', '00000000-0000-0000-0000-000000000102', false, 0,    6990, 'EUR', 'https://chain-b.example.test/p/2', '2026-01-02T10:00:00Z'),
+    ('00000000-0000-0000-0000-000000000305', 'chain-c', '00000000-0000-0000-0000-000000000203', '00000000-0000-0000-0000-000000000101', true,  1,    NULL, 'EUR', 'https://chain-c.example.test/p/1', '2026-01-02T08:00:00Z');
+
+-- subscriptions: pending, confirmed (product-specific), confirmed (any product), unsubscribed
+INSERT INTO subscriptions (id, email, plz, radius_km, product_id, confirm_token, unsub_token, created_at, confirmed_at, unsubbed_at) VALUES
+    ('00000000-0000-0000-0000-000000000401', 'pending@example.test',   '73035', 50,  '00000000-0000-0000-0000-000000000101', 'confirm-401', 'unsub-401', '2026-01-01T12:00:00Z', NULL,                   NULL),
+    ('00000000-0000-0000-0000-000000000402', 'confirmed@example.test', '73035', 50,  '00000000-0000-0000-0000-000000000101', 'confirm-402', 'unsub-402', '2026-01-01T12:00:00Z', '2026-01-01T12:05:00Z', NULL),
+    ('00000000-0000-0000-0000-000000000403', 'any@example.test',       '50667', 100, NULL,                                   'confirm-403', 'unsub-403', '2026-01-01T12:00:00Z', '2026-01-01T12:05:00Z', NULL),
+    ('00000000-0000-0000-0000-000000000404', 'gone@example.test',      '73035', 50,  '00000000-0000-0000-0000-000000000101', 'confirm-404', 'unsub-404', '2026-01-01T12:00:00Z', '2026-01-01T12:05:00Z', '2026-01-01T13:00:00Z');
+
+-- notifications: one already sent to the confirmed subscriber
+INSERT INTO notifications (id, subscription_id, source_key, store_id, product_id, dedupe_key, sent_at) VALUES
+    ('00000000-0000-0000-0000-000000000501', '00000000-0000-0000-0000-000000000402', 'chain-b', '00000000-0000-0000-0000-000000000201', '00000000-0000-0000-0000-000000000101',
+     'chain-b:00000000-0000-0000-0000-000000000201:00000000-0000-0000-0000-000000000101', '2026-01-02T10:01:00Z');

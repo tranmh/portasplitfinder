@@ -1,0 +1,905 @@
+#!/usr/bin/env -S python3 -I
+"""aqaa-sql: database code under test, for the sql-postgres and sql-mssql profiles (and their CI pipelines).
+
+  aqaa-sql test <postgres|mssql> <junit.xml> [--level unit|integration|all] [--filter TEXT]
+  aqaa-sql migrate <postgres|mssql> <findings.json> [--fail]
+  aqaa-sql sqlfluff <postgres|tsql> <findings.json> [--fail]
+  aqaa-sql squawk <findings.json> [--fail]
+  aqaa-sql plan [<postgres|mssql>]
+
+Every database command works on a fresh database of the run's test service (AQAA_PG_URL, or AQAA_MSSQL_URL /
+AQAA_MSSQL_CONNECTION_STRING), created for the command and dropped afterwards; the repository is never written.
+
+test: the repository's schema goes in first (its migrations in the order of the migration tool, else its .sql files,
+retried until no file makes progress), then the tests run:
+  - postgres: pgTAP test files (.sql/.pg under a test folder that call plan()/no_plan()/finish()), each run with psql
+    the way pg_prove runs it; the TAP output becomes JUnit (one case per assertion, a failed plan or a psql error is an
+    error case). pgTAP is the server's extension (CREATE EXTENSION; tests that create it themselves do so), or the
+    plain pgtap.sql of the image when the server has none.
+  - mssql: tSQLt (installed into the fresh database: CLR enabled, PrepareServer.sql, tSQLt.class.sql), the test classes
+    of the repository (files that call tSQLt.NewTestClass or create [test ...] procedures), EXEC tSQLt.RunAll; the
+    results (tSQLt.TestResult, what tSQLt.XmlResultFormatter reads) become JUnit.
+  Integration tests are the test files under a folder named integration; unit tests are the others. A filter keeps the
+  test files whose path contains it, else the cases whose name contains it.
+migrate: applies every migration to a fresh database in order and, where the tool has down migrations (golang-migrate
+  .down.sql, dbmate migrate:down, sqitch revert, Flyway U files), reverts them all and applies them again; each failure
+  is a finding (file, line, the database's error).
+sqlfluff / squawk: the linters' JSON (sqlfluff over the .sql files; squawk over the PostgreSQL migrations).
+plan: prints what test and migrate would apply, as JSON (no database).
+"""
+
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from pathlib import Path
+from xml.sax.saxutils import escape, quoteattr
+
+SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "vendor", "target", "build", "dist", ".venv", "venv", "bin", "obj",
+             "__pycache__", ".idea", ".vscode", ".aqaa", "coverage", "testdata", "packages"}
+SQL_EXT = {".sql", ".pg", ".pgsql", ".psql", ".tsql"}
+TEST_DIR_NAMES = {"t", "test", "tests", "pgtap", "tsqlt", "spec", "specs"}
+MAX_FILES = 3000
+MAX_BYTES = 2 << 20
+PGTAP_SQL = os.environ.get("AQAA_PGTAP_SQL", "/opt/pgtap/pgtap.sql")
+TSQLT_DIR = os.environ.get("AQAA_TSQLT_DIR", "/opt/tsqlt")
+
+PGTAP_RE = re.compile(r"\b(plan|no_plan|finish|runtests)\s*\(", re.I)
+PGTAP_EXT_RE = re.compile(r"create\s+extension\s+(if\s+not\s+exists\s+)?\"?pgtap\b", re.I)
+TSQLT_TEST_RE = re.compile(r"tSQLt\s*\.\s*NewTestClass|create\s+(or\s+alter\s+)?proc(edure)?\s+[\[\"]?\w+[\]\"]?\s*\.\s*[\[\"]test", re.I)
+TSQLT_VENDORED_RE = re.compile(r"create\s+schema\s+\[?tSQLt\]?|tSQLt\s*\.\s*Private_", re.I)
+SQLCMD_RE = re.compile(r"^\s*:(r|setvar|on\s+error)\b", re.I | re.M)
+GO_RE = re.compile(r"^\s*GO\s*(?:\d+\s*)?;?\s*(?:--.*)?$", re.I)
+CONCURRENTLY_RE = re.compile(r"\bconcurrently\b|\balter\s+type\b[^;]*\badd\s+value\b|\bvacuum\b", re.I)
+FLYWAY_RE = re.compile(r"^V(\d+(?:[._]\d+)*)__.+\.sql$", re.I)
+FLYWAY_UNDO_RE = re.compile(r"^U(\d+(?:[._]\d+)*)__.+\.sql$", re.I)
+FLYWAY_REPEAT_RE = re.compile(r"^R__.+\.sql$", re.I)
+GOMIGRATE_RE = re.compile(r"^(\d+)_.+\.up\.sql$", re.I)
+NUMBERED_RE = re.compile(r"^(\d+)[_-].+\.sql$", re.I)
+MIGRATION_DIRS = {"migrations", "migration", "migrate", "db_migrations", "schema_migrations"}
+
+
+def warn(msg):
+    print("aqaa-sql: " + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Discovery
+
+
+def walk(root):
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
+        for f in sorted(filenames):
+            p = Path(dirpath, f)
+            if p.suffix.lower() in SQL_EXT or f == "sqitch.plan":
+                try:
+                    if p.stat().st_size <= MAX_BYTES:
+                        out.append(p.relative_to(root))
+                except OSError:
+                    pass
+            if len(out) >= MAX_FILES:
+                return out
+    return out
+
+
+def read(root, rel):
+    try:
+        return (Path(root) / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def is_test_path(rel):
+    parts = [p.lower() for p in rel.parts[:-1]]
+    name = rel.name.lower()
+    stem = name.rsplit(".", 1)[0]
+    if stem.startswith("test_") or stem.endswith("_test") or stem.endswith(".test") or stem.endswith("_tests"):
+        return True
+    return any(p in TEST_DIR_NAMES or "test" in p for p in parts)
+
+
+def is_integration(rel):
+    return any(p.lower() in ("integration", "integration-tests", "integration_tests") for p in rel.parts[:-1])
+
+
+def vendored_tsqlt(name, text):
+    n = name.lower()
+    return n in ("tsqlt.class.sql", "prepareserver.sql", "tsqlt.sql") or bool(TSQLT_VENDORED_RE.search(text[:20000]))
+
+
+def version_key(v):
+    return tuple(int(x) for x in re.split(r"[._]", v) if x.isdigit())
+
+
+def natural_key(rel):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(rel))]
+
+
+class Plan:
+    """What a database command applies: the schema (in order), down steps, the tests."""
+
+    def __init__(self):
+        self.tool = "none"  # sqitch | flyway | golang-migrate | dbmate | liquibase | numbered | schema files
+        self.up = []  # [(rel, text or None)] text None: the file as it is
+        self.down = []  # [(rel, text or None)] in the order they run
+        self.retry = False  # schema files: retry the ones that fail until no progress
+        self.tests = []
+        self.notes = []
+
+    def as_json(self):
+        return {"tool": self.tool, "up": [str(r) for r, _ in self.up], "down": [str(r) for r, _ in self.down],
+                "retry": self.retry, "tests": [str(t) for t in self.tests], "notes": self.notes}
+
+
+def split_dbmate(text):
+    up, down, cur = [], [], None
+    for line in text.splitlines(keepends=True):
+        s = line.strip().lower()
+        if s.startswith("-- migrate:up"):
+            cur = up
+            continue
+        if s.startswith("-- migrate:down"):
+            cur = down
+            continue
+        if cur is not None:
+            cur.append(line)
+    return "".join(up), "".join(down)
+
+
+def discover(root, engine):
+    files = walk(root)
+    p = Plan()
+    texts = {}
+
+    def text(rel):
+        if rel not in texts:
+            texts[rel] = read(root, rel)
+        return texts[rel]
+
+    # Tests: pgTAP files under a test folder; tSQLt test classes wherever they are (they name themselves).
+    for f in files:
+        if f.suffix.lower() not in SQL_EXT:
+            continue
+        if engine == "postgres" and is_test_path(f) and PGTAP_RE.search(text(f)):
+            p.tests.append(f)
+        elif engine == "mssql" and TSQLT_TEST_RE.search(text(f)) and not vendored_tsqlt(f.name, text(f)):
+            p.tests.append(f)
+    code = [f for f in files if f.suffix.lower() in SQL_EXT and not is_test_path(f) and f not in p.tests]
+
+    # Migrations, by tool.
+    plans = [f for f in files if f.name == "sqitch.plan"]
+    if plans:
+        plan = min(plans, key=lambda x: len(x.parts))
+        top = plan.parent
+        # Changes and tags in plan order. A reworked change appears again after a tag: its earlier occurrences deploy
+        # and revert with <change>@<first tag after it>.sql, the last one with <change>.sql.
+        entries = []
+        for line in text(plan).splitlines():
+            line = line.strip()
+            if not line or line[0] in "%#":
+                continue
+            entries.append(line.split()[0])
+        scripts = []
+        for i, e in enumerate(entries):
+            if e.startswith("@"):
+                continue
+            script = e
+            if e in entries[i + 1:]:
+                tag = next((t for t in entries[i + 1:] if t.startswith("@")), "")
+                script = e + tag
+            scripts.append(script)
+        for c in scripts:
+            dep = top / "deploy" / (c + ".sql")
+            if (Path(root) / dep).is_file():
+                p.up.append((dep, None))
+        for c in reversed(scripts):
+            rev = top / "revert" / (c + ".sql")
+            if (Path(root) / rev).is_file():
+                p.down.append((rev, None))
+        if len(p.down) != len(p.up):
+            p.down = []
+        p.tool = "sqitch"
+        return p
+    flyway = [f for f in code if FLYWAY_RE.match(f.name)]
+    if flyway:
+        flyway.sort(key=lambda f: version_key(FLYWAY_RE.match(f.name).group(1)))
+        p.up = [(f, None) for f in flyway]
+        p.up += [(f, None) for f in sorted((f for f in code if FLYWAY_REPEAT_RE.match(f.name)), key=lambda f: f.name.lower())]
+        undo = {FLYWAY_UNDO_RE.match(f.name).group(1): f for f in code if FLYWAY_UNDO_RE.match(f.name)}
+        if undo and all(FLYWAY_RE.match(f.name).group(1) in undo for f in flyway):
+            p.down = [(undo[FLYWAY_RE.match(f.name).group(1)], None) for f in reversed(flyway)]
+        p.tool = "flyway"
+        return p
+    gm = [f for f in code if GOMIGRATE_RE.match(f.name)]
+    if gm:
+        gm.sort(key=lambda f: (int(GOMIGRATE_RE.match(f.name).group(1)), f.name))
+        p.up = [(f, None) for f in gm]
+        downs = [f.with_name(f.name[: -len(".up.sql")] + ".down.sql") for f in reversed(gm)]
+        if all((Path(root) / d).is_file() for d in downs):
+            p.down = [(d, None) for d in downs]
+        p.tool = "golang-migrate"
+        return p
+    dbm = [f for f in code if NUMBERED_RE.match(f.name) and "-- migrate:up" in text(f)]
+    if dbm:
+        dbm.sort(key=lambda f: natural_key(f.name))
+        for f in dbm:
+            up, down = split_dbmate(text(f))
+            p.up.append((f, up))
+        for f in reversed(dbm):
+            up, down = split_dbmate(text(f))
+            if down.strip():
+                p.down.append((f, down))
+        if len(p.down) != len(p.up):
+            p.down = []
+        p.tool = "dbmate"
+        return p
+    lq = [f for f in code if text(f).lstrip().lower().startswith("--liquibase formatted sql")]
+    if lq:
+        p.up = [(f, None) for f in sorted(lq, key=natural_key)]
+        p.tool = "liquibase"
+        p.notes.append("Liquibase formatted SQL changelogs are applied in path order (aqaa runs SQL, not Liquibase)")
+        return p
+    numbered = [f for f in code if NUMBERED_RE.match(f.name) and any(d.lower() in MIGRATION_DIRS for d in f.parts[:-1])]
+    if numbered:
+        numbered.sort(key=lambda f: (str(f.parent).lower(), natural_key(f.name)))
+        p.up = [(f, None) for f in numbered]
+        p.tool = "numbered"
+        return p
+    # No migration tool: the schema files, ordered by what they create and retried.
+    schema = []
+    for f in code:
+        t = text(f)
+        if SQLCMD_RE.search(t):
+            p.notes.append(f"{f}: a sqlcmd script (:r, :setvar), not applied")
+            continue
+        if engine == "mssql" and vendored_tsqlt(f.name, t):
+            continue
+        if t.lstrip().startswith("\\echo Use \"CREATE EXTENSION"):
+            # An extension script: it runs as CREATE EXTENSION only; applied without its guard.
+            t = re.sub(r"^\\echo.*\n(\\quit\s*\n)?", "", t.lstrip(), count=1)
+            schema.append((f, t))
+            continue
+        schema.append((f, None))
+    schema.sort(key=lambda x: (kind_rank(text(x[0])), natural_key(x[0])))
+    p.up = schema
+    p.retry = True
+    p.tool = "schema files" if schema else "none"
+    return p
+
+
+KIND_ORDER = [r"create\s+(schema|extension|type|domain|sequence)", r"create\s+table", r"create\s+(or\s+replace\s+)?(or\s+alter\s+)?function",
+              r"create\s+(or\s+replace\s+)?(or\s+alter\s+)?view", r"create\s+(or\s+replace\s+)?(or\s+alter\s+)?proc", r"create\s+(or\s+replace\s+)?trigger",
+              r"insert\s+into"]
+
+
+def kind_rank(text):
+    head = text[:20000]
+    for i, pat in enumerate(KIND_ORDER):
+        if re.search(pat, head, re.I):
+            return i
+    return len(KIND_ORDER)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# PostgreSQL
+
+
+class Postgres:
+    def __init__(self):
+        url = os.environ.get("AQAA_PG_URL") or os.environ.get("DATABASE_URL") or ""
+        if not url:
+            raise SystemExit("aqaa-sql: no PostgreSQL service: AQAA_PG_URL is not set (the run's test service postgres)")
+        u = urllib.parse.urlsplit(url)
+        self.env = dict(os.environ)
+        self.env.update({"PGHOST": u.hostname or "localhost", "PGPORT": str(u.port or 5432), "PGUSER": urllib.parse.unquote(u.username or ""),
+                         "PGPASSWORD": urllib.parse.unquote(u.password or ""), "PGDATABASE": (u.path or "/postgres").lstrip("/") or "postgres",
+                         "PGCONNECT_TIMEOUT": "10", "PGOPTIONS": "-c client_min_messages=warning"})
+        q = urllib.parse.parse_qs(u.query)
+        if "sslmode" in q:
+            self.env["PGSSLMODE"] = q["sslmode"][0]
+        self.admin_db = self.env["PGDATABASE"]
+        self.db = None
+
+    def psql(self, args, db=None, cwd=None, stdin=None, timeout=600):
+        env = dict(self.env)
+        env["PGDATABASE"] = db or self.db or self.admin_db
+        cmd = ["psql", "--no-psqlrc", "--quiet", "--set", "ON_ERROR_STOP=1"] + args
+        try:
+            r = subprocess.run(cmd, env=env, cwd=cwd, input=stdin, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {timeout}s"
+        return r.returncode, r.stdout, r.stderr
+
+    def create(self):
+        name = "aqaa_t_" + secrets.token_hex(4)
+        for _ in range(30):
+            rc, _, err = self.psql(["-c", f'CREATE DATABASE "{name}"'], db=self.admin_db)
+            if rc == 0:
+                self.db = name
+                return name
+            if "could not connect" in err or "Connection refused" in err or "the database system is starting up" in err:
+                time.sleep(2)
+                continue
+            raise SystemExit("aqaa-sql: cannot create a database: " + err.strip())
+        raise SystemExit("aqaa-sql: the PostgreSQL service does not answer")
+
+    def drop(self):
+        if self.db:
+            self.psql(["-c", f'DROP DATABASE IF EXISTS "{self.db}" WITH (FORCE)'], db=self.admin_db)
+
+    def apply(self, root, rel, text):
+        """Applies one file (or text) in one transaction when it can; returns (ok, line, error). psql runs in the root,
+        as sqitch and pg_prove do: \\i paths are relative to it, \\ir paths to the file."""
+        body = text if text is not None else read(root, rel)
+        args = ["-v", "VERBOSITY=default"]
+        if not CONCURRENTLY_RE.search(body) and "transaction:false" not in body.replace(" ", ""):
+            args.append("--single-transaction")
+        if text is None:
+            rc, out, err = self.psql(args + ["-f", str(rel)], cwd=str(root))
+        else:
+            with tempfile.NamedTemporaryFile("w", suffix=".sql", dir=None, delete=False) as tf:
+                tf.write(text)
+                tmp = tf.name
+            try:
+                rc, out, err = self.psql(args + ["-f", tmp], cwd=str(root))
+                err = err.replace(tmp, str(rel))
+            finally:
+                os.unlink(tmp)
+        if rc == 0:
+            return True, 0, ""
+        return False, psql_line(err), first_error(err)
+
+
+def psql_line(err):
+    m = re.search(r"psql:[^:\n]*:(\d+): ERROR", err)
+    return int(m.group(1)) if m else 0
+
+
+def first_error(err):
+    lines = [l for l in err.splitlines() if l.strip()]
+    for i, l in enumerate(lines):
+        if "ERROR" in l:
+            msg = re.sub(r"^psql:[^:]*:\d+: ", "", l)
+            extra = [x.strip() for x in lines[i + 1:i + 3] if x.strip().startswith(("DETAIL", "HINT", "LINE"))]
+            return " ".join([msg] + extra)[:600]
+    return " ".join(lines[-3:])[:600] or "failed"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# MS SQL
+
+
+def split_batches(text):
+    batches, cur = [], []
+    for line in text.splitlines():
+        if GO_RE.match(line):
+            if "".join(cur).strip():
+                batches.append("\n".join(cur))
+            cur = []
+        else:
+            cur.append(line)
+    if "".join(cur).strip():
+        batches.append("\n".join(cur))
+    return batches
+
+
+USE_RE = re.compile(r"^\s*USE\s+[\[\]\w.\"]+\s*;?\s*$", re.I | re.M)
+DBLEVEL_RE = re.compile(r"\b(create|alter|drop)\s+database\b", re.I)
+
+
+class MSSQL:
+    def __init__(self):
+        import pymssql  # noqa: F401  (in the image)
+        self.pymssql = pymssql
+        self.server, self.port, self.user, self.password, self.admin_db = mssql_target()
+        self.db = None
+
+    def connect(self, db=None):
+        last = None
+        for _ in range(30):
+            try:
+                return self.pymssql.connect(server=self.server, port=self.port, user=self.user, password=self.password,
+                                            database=db or self.db or self.admin_db, autocommit=True, login_timeout=10, timeout=600)
+            except self.pymssql.OperationalError as e:  # starting up
+                last = e
+                time.sleep(2)
+        raise SystemExit(f"aqaa-sql: the MS SQL service does not answer: {last}")
+
+    def create(self):
+        name = "aqaa_t_" + secrets.token_hex(4)
+        c = self.connect(self.admin_db)
+        c.cursor().execute(f"CREATE DATABASE [{name}]")
+        c.close()
+        self.db = name
+        self.conn = self.connect(name)
+        return name
+
+    def drop(self):
+        if not self.db:
+            return
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        try:
+            c = self.connect("master")
+            c.cursor().execute(f"IF DB_ID('{self.db}') IS NOT NULL BEGIN ALTER DATABASE [{self.db}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{self.db}]; END")
+            c.close()
+        except Exception as e:
+            warn(f"could not drop {self.db}: {e}")
+
+    def batches(self, text, conn=None, transaction=True):
+        """Runs a script's batches; returns (ok, line, error). A script runs in one transaction when it can."""
+        conn = conn or self.conn
+        cur = conn.cursor()
+        text = USE_RE.sub("", text)
+        bs = [b for b in split_batches(text) if not DBLEVEL_RE.search(b)]
+        line = 1
+        offsets, pos = [], 1
+        for b in bs:
+            offsets.append(pos)
+            pos += b.count("\n") + 2
+        if transaction:
+            cur.execute("BEGIN TRANSACTION")
+        for b, off in zip(bs, offsets):
+            try:
+                cur.execute(b)
+                while cur.nextset():
+                    pass
+            except Exception as e:
+                msg = mssql_error(e)
+                if transaction:
+                    try:
+                        cur.execute("IF @@TRANCOUNT > 0 ROLLBACK")
+                    except Exception:
+                        pass
+                return False, off, msg
+        if transaction:
+            cur.execute("IF @@TRANCOUNT > 0 COMMIT")
+        return True, line, ""
+
+    def apply(self, root, rel, text):
+        body = text if text is not None else read(root, rel)
+        return self.batches(body)
+
+    def install_tsqlt(self):
+        prep = Path(TSQLT_DIR, "PrepareServer.sql").read_text(encoding="utf-8", errors="replace")
+        cls = Path(TSQLT_DIR, "tSQLt.class.sql").read_text(encoding="utf-8", errors="replace")
+        m = self.connect("master")
+        cur = m.cursor()
+        cur.execute("EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'clr enabled', 1; RECONFIGURE;")
+        ok, _, err = self.batches(prep, conn=m, transaction=False)
+        m.close()
+        if not ok:
+            raise SystemExit("aqaa-sql: tSQLt's PrepareServer.sql failed: " + err)
+        ok, _, err = self.batches(cls, transaction=False)
+        if not ok:
+            raise SystemExit("aqaa-sql: installing tSQLt failed: " + err)
+
+
+def mssql_target():
+    url = os.environ.get("AQAA_MSSQL_URL", "")
+    if url:
+        u = urllib.parse.urlsplit(url)
+        q = urllib.parse.parse_qs(u.query)
+        return (u.hostname or "localhost", u.port or 1433, urllib.parse.unquote(u.username or "sa"), urllib.parse.unquote(u.password or ""),
+                q.get("database", ["master"])[0])
+    cs = os.environ.get("AQAA_MSSQL_CONNECTION_STRING", "")
+    if cs:
+        kv = {}
+        for part in cs.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                kv[k.strip().lower()] = v.strip()
+        server = kv.get("server") or kv.get("data source") or "localhost"
+        host, _, port = server.replace("tcp:", "").partition(",")
+        return host, int(port or 1433), kv.get("user id") or kv.get("uid") or "sa", kv.get("password") or kv.get("pwd") or "", kv.get("database") or kv.get("initial catalog") or "master"
+    raise SystemExit("aqaa-sql: no MS SQL service: AQAA_MSSQL_URL is not set (the run's test service mssql)")
+
+
+def mssql_error(e):
+    args = getattr(e, "args", ())
+    if len(args) >= 2 and isinstance(args[1], (bytes, bytearray)):
+        msg = args[1].decode("utf-8", "replace")
+    else:
+        msg = str(e)
+    msg = re.sub(r"DB-Lib error message \d+, severity \d+:.*", "", msg, flags=re.S).strip()
+    return " ".join(msg.split())[:600]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Applying a plan
+
+
+def apply_up(db, root, plan, results):
+    """Applies the schema; records every failure in results (rel, line, error, phase)."""
+    pending = list(plan.up)
+    if not plan.retry:
+        for rel, text in pending:
+            ok, line, err = db.apply(root, rel, text)
+            if not ok:
+                results.append((str(rel), line, err, "up"))
+                return False
+        return True
+    failures = {}
+    while pending:
+        progress, left = False, []
+        for rel, text in pending:
+            ok, line, err = db.apply(root, rel, text)
+            if ok:
+                progress = True
+                failures.pop(rel, None)
+            else:
+                failures[rel] = (line, err)
+                left.append((rel, text))
+        pending = left
+        if not progress:
+            break
+    for rel, (line, err) in failures.items():
+        results.append((str(rel), line, err, "up"))
+    return not failures
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# TAP and JUnit
+
+
+class Case:
+    def __init__(self, classname, name, status="passed", message="", time_s=0.0):
+        self.classname, self.name, self.status, self.message, self.time = classname, name, status, message, time_s
+
+
+TAP_RE = re.compile(r"^(not\s+)?ok\b\s*(\d+)?\s*(?:-\s*)?(.*?)\s*$")
+DIRECTIVE_RE = re.compile(r"\s+#\s*(SKIP|TODO)\b\s*(.*)$", re.I)
+
+
+def parse_tap(classname, out):
+    cases, plan, last = [], None, None
+    for raw in out.splitlines():
+        line = raw.rstrip()
+        s = line.strip()
+        m = re.match(r"^1\.\.(\d+)", s)
+        if m:
+            plan = int(m.group(1))
+            continue
+        m = TAP_RE.match(s)
+        if m and (s.startswith("ok") or s.startswith("not ok")):
+            failed, num, desc = bool(m.group(1)), m.group(2), m.group(3)
+            status, directive = ("failed" if failed else "passed"), ""
+            d = DIRECTIVE_RE.search(desc)
+            if d:
+                directive, desc = d.group(1).upper(), desc[: d.start()].strip()
+                status = "skipped"  # SKIP, and TODO (an expected failure) does not fail the run
+            name = desc or f"test {num or len(cases) + 1}"
+            last = Case(classname, name, status, d.group(2).strip() if d else "")
+            cases.append(last)
+            continue
+        if s.startswith("#") and last is not None and last.status == "failed" and not s.lstrip("# ").startswith("Looks like"):
+            last.message = (last.message + "\n" + s.lstrip("# ").rstrip()).strip()
+    return cases, plan
+
+
+def write_junit(path, cases, suite_name):
+    by = {}
+    for c in cases:
+        by.setdefault(c.classname, []).append(c)
+    total = len(cases)
+    fails = sum(1 for c in cases if c.status == "failed")
+    errs = sum(1 for c in cases if c.status == "error")
+    skips = sum(1 for c in cases if c.status == "skipped")
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           f'<testsuites name={quoteattr(suite_name)} tests="{total}" failures="{fails}" errors="{errs}" skipped="{skips}">']
+    for cls, cs in by.items():
+        out.append(f'  <testsuite name={quoteattr(cls)} tests="{len(cs)}" failures="{sum(c.status == "failed" for c in cs)}" '
+                   f'errors="{sum(c.status == "error" for c in cs)}" skipped="{sum(c.status == "skipped" for c in cs)}">')
+        for c in cs:
+            head = f'    <testcase classname={quoteattr(cls)} name={quoteattr(c.name)} time="{c.time:.3f}"'
+            if c.status == "passed":
+                out.append(head + "/>")
+            else:
+                tag = {"failed": "failure", "error": "error", "skipped": "skipped"}[c.status]
+                first = (c.message.splitlines() or [""])[0][:300]
+                out.append(head + ">")
+                out.append(f"      <{tag} message={quoteattr(first)}>{escape(c.message)}</{tag}>")
+                out.append("    </testcase>")
+        out.append("  </testsuite>")
+    out.append("</testsuites>")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def select_tests(plan, level, flt):
+    tests = [t for t in plan.tests if level == "all" or is_integration(t) == (level == "integration")]
+    if flt:
+        by_path = [t for t in tests if flt.lower() in str(t).lower()]
+        if by_path:
+            return by_path, None
+        return tests, flt
+    return tests, None
+
+
+def keep_filtered(cases, flt):
+    if not flt:
+        return cases
+    f = flt.lower()
+    return [c for c in cases if f in c.name.lower() or f in (c.classname + "." + c.name).lower() or f in c.classname.lower()]
+
+
+def schema_cases(results, engine):
+    cs = []
+    for rel, line, err, phase in results:
+        where = f"{rel}:{line}" if line else rel
+        cs.append(Case("schema", f"apply {rel}", "error", f"the schema did not apply on a fresh {engine} database: {where}: {err}"))
+    return cs
+
+
+def cmd_test(engine, out, level, flt):
+    root = Path.cwd()
+    plan = discover(root, engine)
+    tests, case_filter = select_tests(plan, level, flt)
+    if not tests:
+        write_junit(out, [], f"{engine} {level}")
+        print(f"aqaa-sql: no {level} test files ({'pgTAP' if engine == 'postgres' else 'tSQLt'})")
+        return 0
+    if engine == "postgres":
+        return pg_test(root, plan, tests, case_filter, out, level)
+    return mssql_test(root, plan, tests, case_filter, out, level)
+
+
+def pg_test(root, plan, tests, flt, out, level):
+    db = Postgres()
+    db.create()
+    try:
+        results = []
+        apply_up(db, root, plan, results)
+        for r in results:
+            print(f"aqaa-sql: schema: {r[0]}:{r[1]}: {r[2]}")
+        cases = schema_cases(results, "PostgreSQL")
+        creates_itself = any(PGTAP_EXT_RE.search(read(root, t)) for t in tests)
+        rc, avail, _ = db.psql(["-tAc", "SELECT count(*) FROM pg_available_extensions WHERE name = 'pgtap'"])
+        if avail.strip() == "1":
+            if not creates_itself:
+                rc, _, err = db.psql(["-c", "CREATE EXTENSION IF NOT EXISTS pgtap"])
+                if rc != 0:
+                    print("aqaa-sql: CREATE EXTENSION pgtap failed: " + first_error(err))
+        else:
+            print("aqaa-sql: the server has no pgtap extension; pgTAP is installed as plain SQL (" + PGTAP_SQL + ")")
+            rc, _, err = db.psql(["-f", PGTAP_SQL])
+            if rc != 0:
+                print("aqaa-sql: installing pgtap.sql failed: " + first_error(err))
+        for t in tests:
+            start = time.time()
+            # As pg_prove runs a test file from the root: no psqlrc, unaligned tuples only, stop at the first error.
+            rc, so, se = db.psql(["--no-align", "--tuples-only", "--pset", "pager=off", "-f", str(t)], cwd=str(root), timeout=900)
+            got, planned = parse_tap(str(t), so)
+            dur = time.time() - start
+            for c in got:
+                c.time = dur / max(len(got), 1)
+            cases += got
+            if rc != 0:
+                cases.append(Case(str(t), "psql", "error", f"{t}: the test file stopped at an error: {first_error(se)}"))
+            elif planned is not None and planned != len(got):
+                cases.append(Case(str(t), "plan", "error", f"{t}: planned {planned} tests but ran {len(got)}"))
+            elif planned is None and not got:
+                cases.append(Case(str(t), "plan", "error", f"{t}: no TAP output (no plan): {so.strip()[:300]}"))
+            sys.stdout.write(so)
+            if se.strip():
+                sys.stdout.write(se)
+        cases = keep_filtered(cases, flt)
+        write_junit(out, cases, f"pgTAP {level}")
+        bad = sum(c.status in ("failed", "error") for c in cases)
+        print(f"aqaa-sql: {len(cases)} cases, {bad} failed or errored")
+        return 1 if bad else 0
+    finally:
+        db.drop()
+
+
+def mssql_test(root, plan, tests, flt, out, level):
+    db = MSSQL()
+    db.create()
+    try:
+        db.install_tsqlt()
+        results = []
+        apply_up(db, root, plan, results)
+        for r in results:
+            print(f"aqaa-sql: schema: {r[0]}:{r[1]}: {r[2]}")
+        cases = schema_cases(results, "SQL Server")
+        for t in tests:
+            ok, line, err = db.batches(read(root, t), transaction=False)
+            if not ok:
+                cases.append(Case(str(t), "load", "error", f"{t}:{line}: the test class did not load: {err}"))
+        cur = db.conn.cursor()
+        try:
+            cur.execute("EXEC tSQLt.RunAll")
+            while cur.nextset():
+                pass
+        except Exception as e:  # tSQLt raises an error when a test fails; the results are in tSQLt.TestResult
+            print("aqaa-sql: tSQLt.RunAll: " + mssql_error(e))
+        cur.execute("SELECT Class, TestCase, Result, ISNULL(Msg, ''), DATEDIFF(MILLISECOND, TestStartTime, ISNULL(TestEndTime, TestStartTime)) FROM tSQLt.TestResult ORDER BY Id")
+        for cls, name, result, msg, ms in cur.fetchall():
+            status = {"Success": "passed", "Failure": "failed", "Error": "error", "Skipped": "skipped"}.get(result, "error")
+            cases.append(Case(cls, name, status, msg, (ms or 0) / 1000.0))
+            print(f"tSQLt: [{cls}].[{name}] {result}{': ' + msg if msg else ''}")
+        cases = keep_filtered(cases, flt)
+        write_junit(out, cases, f"tSQLt {level}")
+        bad = sum(c.status in ("failed", "error") for c in cases)
+        print(f"aqaa-sql: {len(cases)} cases, {bad} failed or errored")
+        return 1 if bad else 0
+    finally:
+        db.drop()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Migration check
+
+
+def cmd_migrate(engine, out):
+    root = Path.cwd()
+    plan = discover(root, engine)
+    report = {"tool": plan.tool, "engine": engine, "migrations": len(plan.up), "down": "none", "findings": [], "notes": list(plan.notes)}
+    if plan.tool == "none":
+        report["notes"].append("no migrations and no schema files found")
+        write_json(out, report)
+        return 0
+    if plan.tool == "schema files":
+        report["notes"].append("no migration tool (Flyway, golang-migrate, dbmate, sqitch, Liquibase SQL or numbered files in a "
+                               "migrations folder): the schema files are applied in dependency order instead")
+    try:
+        db = Postgres() if engine == "postgres" else MSSQL()
+    except SystemExit as e:
+        report["notes"].append(str(e))
+        write_json(out, report)
+        return 0
+    db.create()
+    try:
+        results = []
+        if apply_up(db, root, plan, results) and plan.down:
+            report["down"] = "ok"
+            for rel, text in plan.down:
+                ok, line, err = db.apply(root, rel, text)
+                if not ok:
+                    results.append((str(rel), line, err, "down"))
+                    report["down"] = "failed"
+                    break
+            if report["down"] == "ok":
+                again = []
+                apply_up(db, root, plan, again)
+                results += [(r[0], r[1], r[2], "reapply") for r in again]
+        for rel, line, err, phase in results:
+            if plan.retry:
+                report["findings"].append({"file": rel, "line": line, "rule": "schema-file-failed",
+                                           "message": f"the schema file does not apply on a fresh database (after every other file that could): {err}"})
+                continue
+            rule = {"up": "migration-failed", "down": "down-migration-failed", "reapply": "migration-not-repeatable"}[phase]
+            what = {"up": "does not apply on a fresh database (after the migrations before it)",
+                    "down": "does not revert", "reapply": "fails when applied again after all down migrations"}[phase]
+            report["findings"].append({"file": rel, "line": line, "rule": rule, "message": f"{plan.tool} migration {what}: {err}"})
+    finally:
+        db.drop()
+    write_json(out, report)
+    print(f"aqaa-sql: {plan.tool}: {len(plan.up)} migrations, down {report['down']}, {len(report['findings'])} findings")
+    return 0
+
+
+def write_json(path, obj):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(obj, indent=1) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Linters
+
+
+def cmd_sqlfluff(dialect, out):
+    root = Path.cwd()
+    # The code, not its tests (pgTAP's SELECT * FROM finish() is no ambiguity worth a finding).
+    tests = set(discover(root, "mssql" if dialect == "tsql" else "postgres").tests)
+    files = [str(f) for f in walk(root) if f.suffix.lower() in SQL_EXT and not is_test_path(f) and f not in tests
+             and not vendored_tsqlt(f.name, read(root, f)[:20000])
+             and not SQLCMD_RE.search(read(root, f)[:20000])][:400]
+    if not files:
+        write_json(out, [])
+        return 0
+    cfg = any((root / c).is_file() and "sqlfluff" in read(root, c) for c in (".sqlfluff", "setup.cfg", "tox.ini", "pyproject.toml"))
+    cmd = ["sqlfluff", "lint", "--format", "json", "--nofail", "--disable-progress-bar", "--processes", "1", "--ignore", "parsing,templating"]
+    if not cfg:
+        # Without the repository's own configuration: its dialect, and no layout or capitalisation style rules.
+        # tSQLt's test procedures are named [test ...] by convention (RF05).
+        cmd += ["--dialect", dialect, "--exclude-rules", "layout,capitalisation" + (",RF05" if dialect == "tsql" else "")]
+    r = subprocess.run(cmd + files, capture_output=True, text=True, timeout=1500)
+    text = r.stdout.strip() or "[]"
+    try:
+        data = json.loads(text)
+    except ValueError:
+        start = text.find("[")
+        data = json.loads(text[start:]) if start >= 0 else []
+    keep = ("start_line_no", "start_line_pos", "line_no", "line_pos", "code", "description", "name", "warning")
+    data = [{"filepath": f.get("filepath", ""), "violations": [{k: v[k] for k in keep if k in v} for v in f.get("violations", [])]}
+            for f in data if isinstance(f, dict)]
+    write_json(out, data)
+    if r.stderr.strip():
+        sys.stderr.write(r.stderr[-2000:])
+    return 0
+
+
+def cmd_squawk(out):
+    root = Path.cwd()
+    plan = discover(root, "postgres")
+    # squawk lints migrations (the statements that change a live database); dbmate files carry their down section too.
+    files = [str(rel) for rel, _ in plan.up] if plan.tool not in ("none", "schema files") else []
+    if not files:
+        write_json(out, [])
+        return 0
+    cmd = ["squawk", "--reporter", "json"]
+    if not (root / ".squawk.toml").is_file():
+        # Without the repository's own configuration: no rule that only asks for session timeouts in every migration.
+        cmd += ["--exclude", "require-statement-timeout,require-lock-timeout"]
+    r = subprocess.run(cmd + files[:500], capture_output=True, text=True, timeout=600)
+    text = r.stdout.strip() or "[]"
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = []
+        warn("squawk: " + (r.stderr or text)[-500:])
+    write_json(out, data)
+    return 0
+
+
+def report_findings(path):
+    """--fail (the CI pipelines): prints the findings of a JSON report and returns 1 when there are any."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    lines = []
+    if isinstance(data, dict):  # migrate
+        lines = [f"{f['file']}:{f['line']}: {f['rule']}: {f['message']}" for f in data.get("findings", [])]
+        lines += ["note: " + n for n in data.get("notes", [])]
+        bad = bool(data.get("findings"))
+    elif data and "violations" in data[0]:  # sqlfluff
+        lines = [f"{f['filepath']}:{v.get('start_line_no', v.get('line_no', 0))}: {v.get('code')}: {v.get('description')}" for f in data for v in f["violations"]]
+        bad = bool(lines)
+    else:  # squawk
+        lines = [f"{v.get('file')}:{v.get('line', 0) + 1}: {v.get('rule_name')}: {v.get('message')}" for v in data]
+        bad = bool(lines)
+    print("\n".join(lines) or "no findings")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 2
+    cmd = argv[1]
+    if cmd == "test" and len(argv) >= 4:
+        level, flt = "unit", ""
+        rest = argv[4:]
+        while rest:
+            a = rest.pop(0)
+            if a == "--level" and rest:
+                level = rest.pop(0)
+            elif a == "--filter" and rest:
+                flt = rest.pop(0)
+        return cmd_test(argv[2], argv[3], level, flt)
+    fail = "--fail" in argv
+    argv = [a for a in argv if a != "--fail"]
+    if cmd == "migrate" and len(argv) == 4:
+        return cmd_migrate(argv[2], argv[3]) or (fail and report_findings(argv[3]))
+    if cmd == "sqlfluff" and len(argv) == 4:
+        return cmd_sqlfluff(argv[2], argv[3]) or (fail and report_findings(argv[3]))
+    if cmd == "squawk" and len(argv) == 3:
+        return cmd_squawk(argv[2]) or (fail and report_findings(argv[2]))
+    if cmd == "plan":
+        engine = argv[2] if len(argv) > 2 else "postgres"
+        print(json.dumps(discover(Path.cwd(), engine).as_json(), indent=1))
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
