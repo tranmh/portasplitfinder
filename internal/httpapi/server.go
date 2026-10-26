@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -38,6 +40,41 @@ type Server struct {
 	publicBaseURL string
 	webOrigin     string
 	log           *slog.Logger
+
+	// subMu guards subSeen: recent subscribe timestamps per (lowercased)
+	// email, used to cap confirmation mails sent to one address.
+	subMu   sync.Mutex
+	subSeen map[string][]time.Time
+}
+
+// Per-address subscribe throttle: at most subLimit requests per subWindow.
+const (
+	subLimit  = 3
+	subWindow = time.Hour
+)
+
+// allowSubscribe records a subscribe attempt for email and reports whether it
+// is within the per-address limit.
+func (s *Server) allowSubscribe(email string) bool {
+	key := strings.ToLower(strings.TrimSpace(email))
+	now := time.Now()
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	if s.subSeen == nil {
+		s.subSeen = map[string][]time.Time{}
+	}
+	recent := s.subSeen[key][:0]
+	for _, t := range s.subSeen[key] {
+		if now.Sub(t) < subWindow {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= subLimit {
+		s.subSeen[key] = recent
+		return false
+	}
+	s.subSeen[key] = append(recent, now)
+	return true
 }
 
 // Config configures the API server.
@@ -238,6 +275,10 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validRadius(radius) {
 		writeError(w, http.StatusBadRequest, codeValidation, "radiusKm must be in 1..500", fieldPtr("radiusKm"))
+		return
+	}
+	if !s.allowSubscribe(req.Email) {
+		writeError(w, http.StatusTooManyRequests, codeRateLimit, "too many subscription requests for this email", nil)
 		return
 	}
 
