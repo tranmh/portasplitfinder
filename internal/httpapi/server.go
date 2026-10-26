@@ -106,7 +106,7 @@ func New(cfg Config) *Server {
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(middleware.ClientIPFromRemoteAddr)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(s.cors)
