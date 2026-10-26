@@ -67,6 +67,37 @@ func FuzzHandleStoreSearchPagination(f *testing.F) {
 	})
 }
 
+// TestHandleStoreSearchPaginationSeed0 is seed#0 of
+// FuzzHandleStoreSearchPagination: 5 stores, page=2, pageSize=2 must return
+// stores s002 and s003.
+func TestHandleStoreSearchPaginationSeed0(t *testing.T) {
+	fs := newFakeStore()
+	for i := 0; i < 5; i++ {
+		fs.stores = append(fs.stores, domain.Store{ID: fmt.Sprintf("s%03d", i), Name: fmt.Sprintf("Store %03d", i), City: "X"})
+	}
+	s, _ := newTestServer(fs)
+	path := "/api/stores?page=2&pageSize=2"
+	rr := do(s, http.MethodGet, path, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("%s: status %d, body %s", path, rr.Code, rr.Body.String())
+	}
+	var resp StoreSearchResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("%s: decode: %v", path, err)
+	}
+	if resp.Total != 5 {
+		t.Errorf("%s: total %d, want 5", path, resp.Total)
+	}
+	if len(resp.Stores) != 2 {
+		t.Fatalf("%s with 5 stores: got %d items, want 2", path, len(resp.Stores))
+	}
+	for i, wantID := range []string{"s002", "s003"} {
+		if resp.Stores[i].Store.ID != wantID {
+			t.Errorf("%s: item %d is %s, want %s", path, i, resp.Stores[i].Store.ID, wantID)
+		}
+	}
+}
+
 // FuzzHandleStoreSearchParams: the handler answers 200 exactly when plz, page
 // and pageSize are valid (or absent), and otherwise 400 naming the first
 // invalid field in the order plz, page, pageSize.
