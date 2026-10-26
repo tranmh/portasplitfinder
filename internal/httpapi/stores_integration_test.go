@@ -202,9 +202,6 @@ func TestIntegrationStoreSearchPagination(t *testing.T) {
 	}
 	for _, tc := range full {
 		t.Run(tc.name, func(t *testing.T) {
-			// aqaa: suspected bug [B8] - handleStoreSearch computes
-			// end = start+pageSize-1, so every non-final page has pageSize-1 stores.
-			t.Skip("aqaa: open bug, see report")
 			_, body, raw := getStores(t, ts, tc.query)
 			if strings.Join(body.names(), "|") != strings.Join(tc.want, "|") {
 				t.Fatalf("%s: stores = %v, want %v (%s)", tc.query, body.names(), tc.want, raw)
@@ -213,8 +210,6 @@ func TestIntegrationStoreSearchPagination(t *testing.T) {
 	}
 
 	t.Run("walking all pages yields every store once", func(t *testing.T) {
-		// aqaa: suspected bug [B8] - stores at the page boundary are skipped.
-		t.Skip("aqaa: open bug, see report")
 		var seen []string
 		for page := 1; page <= 3; page++ {
 			_, body, _ := getStores(t, ts, fmt.Sprintf("pageSize=2&page=%d", page))
