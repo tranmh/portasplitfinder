@@ -144,6 +144,38 @@ func TestSubscribe_Confirm_Unsub_Flow(t *testing.T) {
 	}
 }
 
+func TestSubscribe_ThrottlesRepeatedRequestsForSameEmail(t *testing.T) {
+	fs := newFakeStore()
+	s, mailer := newTestServer(fs)
+
+	const attempts = 50
+	const maxAllowed = 10
+	body := []byte(`{"email":"victim@example.com","plz":"73035"}`)
+	limited := 0
+	for i := 0; i < attempts; i++ {
+		rr := do(s, http.MethodPost, "/api/subscriptions", body)
+		switch rr.Code {
+		case http.StatusAccepted:
+		case http.StatusTooManyRequests:
+			limited++
+			var e apiError
+			_ = json.Unmarshal(rr.Body.Bytes(), &e)
+			if e.Error != "rate_limited" {
+				t.Errorf("attempt %d: error code %q, want rate_limited", i, e.Error)
+			}
+		default:
+			t.Fatalf("attempt %d: status %d, want 202 or 429", i, rr.Code)
+		}
+	}
+	if mailer.Count() > maxAllowed {
+		t.Errorf("sent %d confirm mails to the same address in a burst of %d, want at most %d", mailer.Count(), attempts, maxAllowed)
+	}
+	if fs.created > maxAllowed {
+		t.Errorf("stored %d subscription rows for the same address in a burst of %d, want at most %d", fs.created, attempts, maxAllowed)
+	}
+	t.Logf("429 responses: %d", limited)
+}
+
 func TestAvailability_BadPLZ(t *testing.T) {
 	s, _ := newTestServer(newFakeStore())
 	rr := do(s, http.MethodGet, "/api/availability?plz=abc", nil)
