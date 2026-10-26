@@ -161,10 +161,6 @@ func TestIntegrationStoreRepoSearch(t *testing.T) {
 	}
 	for _, tc := range literal {
 		t.Run("literal "+tc.name, func(t *testing.T) {
-			// aqaa: suspected bug [B1, B2] - Search concatenates q into the SQL
-			// text: a quote causes a syntax error (or injection) and %/_ act as
-			// wildcards matching every store.
-			t.Skip("aqaa: open bug, see report")
 			got, err := db.Stores.Search(ctx, tc.q)
 			if err != nil {
 				t.Fatalf("search %q: %v", tc.q, err)
