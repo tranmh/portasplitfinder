@@ -1,4 +1,8 @@
-import { test, expect, type Page, type Request, type Route } from "@playwright/test";
+// @playwright/test is installed by the e2e runner only, not in web/package.json.
+// @ts-ignore TS2307 when the package is absent
+import { test, expect, type APIRequestContext, type Page, type Request, type Response, type Route } from "@playwright/test";
+
+type PageFixtures = { page: Page };
 
 /**
  * E2E: the "Markt suchen" (StoreSearch) flow on the home page, against the
@@ -76,7 +80,7 @@ async function stubStoreSearch(
 ): Promise<URLSearchParams[]> {
   const seen: URLSearchParams[] = [];
   await page.route(
-    (url) => url.pathname === "/api/stores",
+    (url: URL) => url.pathname === "/api/stores",
     async (route: Route) => {
       const query = new URL(route.request().url()).searchParams;
       seen.push(query);
@@ -113,7 +117,7 @@ async function submitSearch(page: Page, term: string) {
 // ---------------------------------------------------------------------------
 
 test.describe("store search by name or city", () => {
-  test("submits the trimmed term with the default PLZ and shows rows with stock badges", async ({ page }) => {
+  test("submits the trimmed term with the default PLZ and shows rows with stock badges", async ({ page }: PageFixtures) => {
     const seen = await stubStoreSearch(page, () => ({
       body: searchBody(
         [
@@ -149,12 +153,12 @@ test.describe("store search by name or city", () => {
     await expect(section.getByRole("button", { name: t.loadMore })).toHaveCount(0);
   });
 
-  test("omits plz once the PLZ filter is cleared", async ({ page }) => {
+  test("omits plz once the PLZ filter is cleared", async ({ page }: PageFixtures) => {
     const seen = await stubStoreSearch(page, () => ({ body: searchBody([], 0) }));
     await openHome(page);
 
     const cleared = page.waitForRequest(
-      (req) => isAvailabilityRequest(req) && !new URL(req.url()).searchParams.has("plz"),
+      (req: Request) => isAvailabilityRequest(req) && !new URL(req.url()).searchParams.has("plz"),
     );
     await page.getByLabel("Postleitzahl (PLZ)").fill("");
     await cleared;
@@ -167,7 +171,7 @@ test.describe("store search by name or city", () => {
     expect(seen[0].has("plz")).toBe(false);
   });
 
-  test("loads more pages and a new search replaces the results", async ({ page }) => {
+  test("loads more pages and a new search replaces the results", async ({ page }: PageFixtures) => {
     const seen = await stubStoreSearch(page, (query) => {
       if (query.get("q") === "Ulm") {
         return { body: searchBody([{ id: "u-1", name: "Bauhaus Ulm", plz: "89073", city: "Ulm", distanceKm: 40, inStock: [true] }], 1) };
@@ -210,7 +214,7 @@ test.describe("store search by name or city", () => {
     expect(seen[2].get("page")).toBe("1");
   });
 
-  test("shows an error message when the search request fails", async ({ page }) => {
+  test("shows an error message when the search request fails", async ({ page }: PageFixtures) => {
     await stubStoreSearch(page, () => ({ status: 500, body: { error: "internal", message: "boom" } }));
     await openHome(page);
 
@@ -221,10 +225,10 @@ test.describe("store search by name or city", () => {
     await expect(section.getByRole("listitem")).toHaveCount(0);
   });
 
-  test("shows the empty state for a term without matches (real API)", async ({ page }) => {
+  test("shows the empty state for a term without matches (real API)", async ({ page }: PageFixtures) => {
     await openHome(page);
 
-    const response = page.waitForResponse((res) => new URL(res.url()).pathname === "/api/stores");
+    const response = page.waitForResponse((res: Response) => new URL(res.url()).pathname === "/api/stores");
     await submitSearch(page, "zzqx-aqaa-kein-markt");
     expect((await response).status()).toBe(200);
 
@@ -234,7 +238,7 @@ test.describe("store search by name or city", () => {
     await expect(section.getByRole("listitem")).toHaveCount(0);
   });
 
-  test("GET /api/stores returns a full page when enough stores match (real API)", async ({ request }) => {
+  test("GET /api/stores returns a full page when enough stores match (real API)", async ({ request }: { request: APIRequestContext }) => {
     const res = await request.get(`${API_URL}/api/stores?pageSize=1&page=1`);
     expect(res.status()).toBe(200);
     const body = await res.json();
