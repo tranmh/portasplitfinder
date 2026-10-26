@@ -7,6 +7,70 @@ import {
   jsonResponse,
   stubFetch,
 } from "@/test/__tests__/doubles";
+import { test } from "vitest";
+import fc from "fast-check";
+
+// Well-formed strings (no lone surrogates).
+const text = fc.string({ unit: "binary" });
+
+test("searchStores query params round trip through the URL", async () => {
+  await fc.assert(
+    fc.asyncProperty(
+      fc.record({
+        q: fc.option(text, { nil: undefined }),
+        plz: fc.option(text, { nil: undefined }),
+        page: fc.option(fc.integer(), { nil: undefined }),
+        pageSize: fc.option(fc.integer(), { nil: undefined }),
+      }),
+      async (query) => {
+        const fetch = stubFetch(jsonResponse(buildStoreSearchResponse()));
+        try {
+          await searchStores(query);
+
+          const url = fetch.url();
+          expect(url.pathname).toBe("/api/stores");
+          expect(url.hash).toBe("");
+          for (const key of ["q", "plz", "page", "pageSize"] as const) {
+            const value = query[key];
+            const expected = value === undefined || value === "" ? [] : [String(value)];
+            expect(url.searchParams.getAll(key)).toEqual(expected);
+          }
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      },
+    ),
+  );
+});
+
+test("searchStores maps any error status and body to ApiError", async () => {
+  await fc.assert(
+    fc.asyncProperty(
+      fc.integer({ min: 400, max: 599 }),
+      fc.record(
+        { error: text, message: text, field: fc.option(text, { nil: null }) },
+        { requiredKeys: ["error"] },
+      ),
+      async (status, body) => {
+        stubFetch(jsonResponse(body, status));
+        try {
+          const err = await searchStores({ q: "obi" }).then(
+            () => new Error("expected searchStores to reject"),
+            (e: unknown) => e,
+          );
+          expect(err).toBeInstanceOf(ApiError);
+          const apiError = err as ApiError;
+          expect(apiError.status).toBe(status);
+          expect(apiError.code).toBe(body.error);
+          expect(apiError.message).toBe(body.message ?? body.error);
+          expect(apiError.field).toBe(body.field ?? null);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      },
+    ),
+  );
+});
 
 describe("searchStores", () => {
   afterEach(() => {
