@@ -43,6 +43,15 @@ func FuzzFormatPriceEUR(f *testing.F) {
 	})
 }
 
+// TestFormatPriceEURNegativeUnderOneEuro is the regression test for fuzz
+// finding F1 (seed FuzzFormatPriceEUR/seed#7): -50 cents lost its sign.
+func TestFormatPriceEURNegativeUnderOneEuro(t *testing.T) {
+	cents := -50
+	if got, want := FormatPriceEUR(&cents), "-0,50 €"; got != want {
+		t.Errorf("FormatPriceEUR(%d) = %q, want %q", cents, got, want)
+	}
+}
+
 // FuzzEncodeHeader checks that an encoded Subject value can never break out
 // of its header line (no CR or LF), whatever the subject contains.
 func FuzzEncodeHeader(f *testing.F) {
