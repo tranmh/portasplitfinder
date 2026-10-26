@@ -1,4 +1,5 @@
 BEGIN;
+\i test/pgtap/support/schema.psql
 \i test/pgtap/seeds/seed.psql
 SELECT plan(7);
 

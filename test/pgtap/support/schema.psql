@@ -1,0 +1,83 @@
+-- Test support: make sure the schema of migrations/00001_init.sql (goose Up) exists.
+-- The migration file holds both the goose Up and Down sections, so running it as
+-- plain SQL creates and then drops every table. This mirrors the Up section with
+-- IF NOT EXISTS, so it is a no-op when the schema was applied already.
+-- Include it inside a test transaction (after BEGIN, before plan) with:
+--   \i test/pgtap/support/schema.psql
+-- Keep it in sync with migrations/.
+
+CREATE TABLE IF NOT EXISTS products (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name       text NOT NULL,
+    model      text NOT NULL,
+    image_url  text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+    key             text PRIMARY KEY,
+    name            text NOT NULL,
+    type            text NOT NULL CHECK (type IN ('online', 'store')),
+    base_url        text NOT NULL,
+    last_checked_at timestamptz,
+    last_status     text NOT NULL DEFAULT 'never' CHECK (last_status IN ('ok', 'error', 'never')),
+    last_error      text
+);
+
+CREATE TABLE IF NOT EXISTS stores (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_key text NOT NULL REFERENCES sources(key) ON DELETE CASCADE,
+    name       text NOT NULL,
+    street     text,
+    plz        text NOT NULL,
+    city       text NOT NULL,
+    lat        double precision NOT NULL,
+    lon        double precision NOT NULL,
+    UNIQUE (source_key, name)
+);
+
+CREATE TABLE IF NOT EXISTS availability_snapshots (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_key  text NOT NULL REFERENCES sources(key) ON DELETE CASCADE,
+    store_id    uuid REFERENCES stores(id) ON DELETE CASCADE,
+    product_id  uuid NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    in_stock    boolean NOT NULL,
+    quantity    integer,
+    price_cents integer,
+    currency    text NOT NULL DEFAULT 'EUR',
+    url         text NOT NULL,
+    checked_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_latest
+    ON availability_snapshots (source_key, store_id, product_id, checked_at DESC);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    email         text NOT NULL,
+    plz           text NOT NULL,
+    radius_km     integer NOT NULL DEFAULT 50,
+    product_id    uuid REFERENCES products(id) ON DELETE CASCADE,
+    confirm_token text NOT NULL,
+    unsub_token   text NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    confirmed_at  timestamptz,
+    unsubbed_at   timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscriptions_confirm_token ON subscriptions (confirm_token);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_unsub_token ON subscriptions (unsub_token);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_confirmed_at ON subscriptions (confirmed_at);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    subscription_id uuid NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    source_key      text NOT NULL,
+    store_id        uuid,
+    product_id      uuid NOT NULL,
+    dedupe_key      text NOT NULL,
+    sent_at         timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (subscription_id, dedupe_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications (subscription_id, dedupe_key);
