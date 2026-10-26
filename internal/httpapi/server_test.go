@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/tranmh/portasplitfinder/internal/domain"
@@ -174,6 +176,42 @@ func TestSubscribe_ThrottlesRepeatedRequestsForSameEmail(t *testing.T) {
 		t.Errorf("stored %d subscription rows for the same address in a burst of %d, want at most %d", fs.created, attempts, maxAllowed)
 	}
 	t.Logf("429 responses: %d", limited)
+}
+
+// countingReader counts how many bytes the handler pulled from the body.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+func TestSubscribe_RejectsOversizedBodyWithoutBufferingIt(t *testing.T) {
+	fs := newFakeStore()
+	s, _ := newTestServer(fs)
+
+	const bodySize = 20 << 20
+	const maxRead = 1 << 20
+	huge := strings.Repeat("a", bodySize)
+	body := &countingReader{r: strings.NewReader(`{"email":"` + huge + `@b.de","plz":"10115"}`)}
+
+	r := httptest.NewRequest(http.MethodPost, "/api/subscriptions", body)
+	rr := httptest.NewRecorder()
+	s.Router().ServeHTTP(rr, r)
+
+	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status %d, want 400 or 413", rr.Code)
+	}
+	if body.n > maxRead {
+		t.Errorf("handler read %d bytes of a %d byte body, want at most %d", body.n, bodySize, maxRead)
+	}
+	if fs.created != 0 {
+		t.Errorf("stored %d subscriptions, want 0", fs.created)
+	}
 }
 
 func TestAvailability_BadPLZ(t *testing.T) {
