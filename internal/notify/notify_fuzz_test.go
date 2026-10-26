@@ -66,3 +66,12 @@ func FuzzEncodeHeader(f *testing.F) {
 		}
 	})
 }
+
+// TestEncodeHeaderNoCRLF is the regression test for fuzz finding F2 (seed
+// FuzzEncodeHeader/seed#3): an ASCII subject with CRLF was passed through raw.
+func TestEncodeHeaderNoCRLF(t *testing.T) {
+	s := "a\r\nBcc: x@y.z"
+	if got := encodeHeader(s); strings.ContainsAny(got, "\r\n") {
+		t.Errorf("encodeHeader(%q) = %q contains CR/LF (header injection)", s, got)
+	}
+}
