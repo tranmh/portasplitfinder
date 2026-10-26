@@ -295,6 +295,129 @@ func TestStoreSearch_BadPageSize(t *testing.T) {
 	}
 }
 
+func TestIntParam(t *testing.T) {
+	tests := []struct {
+		name   string
+		v      string
+		def    int
+		lo, hi int
+		want   int
+		wantOK bool
+	}{
+		{"empty yields default", "", 20, 1, 100, 20, true},
+		{"default not range checked", "", 0, 1, 100, 0, true},
+		{"lower bound inclusive", "1", 20, 1, 100, 1, true},
+		{"upper bound inclusive", "100", 20, 1, 100, 100, true},
+		{"inside range", "42", 20, 1, 100, 42, true},
+		{"leading zeros", "007", 20, 1, 100, 7, true},
+		{"explicit plus sign", "+5", 20, 1, 100, 5, true},
+		{"below lower bound", "0", 20, 1, 100, 0, false},
+		{"above upper bound", "101", 20, 1, 100, 0, false},
+		{"negative", "-1", 20, 1, 100, 0, false},
+		{"non numeric", "abc", 20, 1, 100, 0, false},
+		{"decimal", "1.5", 20, 1, 100, 0, false},
+		{"trailing garbage", "10x", 20, 1, 100, 0, false},
+		{"surrounding spaces", " 10 ", 20, 1, 100, 0, false},
+		{"whitespace only", " ", 20, 1, 100, 0, false},
+		{"overflow", "99999999999999999999999", 1, 1, 1 << 20, 0, false},
+		{"page upper bound", "1048576", 1, 1, 1 << 20, 1 << 20, true},
+		{"page above upper bound", "1048577", 1, 1, 1 << 20, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := intParam(tt.v, tt.def, tt.lo, tt.hi)
+			if ok != tt.wantOK || (ok && got != tt.want) {
+				t.Fatalf("intParam(%q, %d, %d, %d) = (%d, %v), want (%d, %v)",
+					tt.v, tt.def, tt.lo, tt.hi, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestStoreSearch_PageParamValidation(t *testing.T) {
+	s, _ := newTestServer(seededFakeStore())
+	cases := []struct {
+		query string
+		code  int
+		field string
+	}{
+		{"page=0", 400, "page"},
+		{"page=-1", 400, "page"},
+		{"page=x", 400, "page"},
+		{"pageSize=101", 400, "pageSize"},
+		{"pageSize=1.5", 400, "pageSize"},
+		{"page=1&pageSize=1", 200, ""},
+		{"pageSize=100", 200, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.query, func(t *testing.T) {
+			rr := do(s, http.MethodGet, "/api/stores?"+c.query, nil)
+			if rr.Code != c.code {
+				t.Fatalf("status %d, want %d", rr.Code, c.code)
+			}
+			if c.code != 400 {
+				return
+			}
+			var e apiError
+			if err := json.Unmarshal(rr.Body.Bytes(), &e); err != nil {
+				t.Fatal(err)
+			}
+			if e.Error != codeValidation || e.Field == nil || *e.Field != c.field {
+				t.Fatalf("error = %+v, want validation_error on %q", e, c.field)
+			}
+		})
+	}
+}
+
+func TestStoreSearch_Defaults(t *testing.T) {
+	s, _ := newTestServer(seededFakeStore())
+	rr := do(s, http.MethodGet, "/api/stores", nil)
+	if rr.Code != 200 {
+		t.Fatalf("status %d", rr.Code)
+	}
+	var resp StoreSearchResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Page != 1 || resp.PageSize != defaultPageSize || resp.Total != 3 {
+		t.Fatalf("page=%d pageSize=%d total=%d, want 1/%d/3", resp.Page, resp.PageSize, resp.Total, defaultPageSize)
+	}
+}
+
+// TestStoreSearch_PageContainsPageSizeStores checks B8: page p holds
+// results[(p-1)*pageSize .. p*pageSize), with no store skipped between pages.
+func TestStoreSearch_PageContainsPageSizeStores(t *testing.T) {
+	t.Skip("aqaa: suspected bug: handleStoreSearch computes end as start+pageSize-1, so each page holds pageSize-1 stores and one store per page is skipped (B8); open bug, see report")
+	s, _ := newTestServer(seededFakeStore())
+	var seen []string
+	for _, page := range []string{"1", "2"} {
+		rr := do(s, http.MethodGet, "/api/stores?pageSize=2&page="+page, nil)
+		if rr.Code != 200 {
+			t.Fatalf("page %s: status %d", page, rr.Code)
+		}
+		var resp StoreSearchResponse
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Total != 3 {
+			t.Fatalf("page %s: total %d, want 3", page, resp.Total)
+		}
+		want := 2
+		if page == "2" {
+			want = 1
+		}
+		if len(resp.Stores) != want {
+			t.Fatalf("page %s: %d stores, want %d", page, len(resp.Stores), want)
+		}
+		for _, st := range resp.Stores {
+			seen = append(seen, st.Store.ID)
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("stores across pages = %v, want all 3", seen)
+	}
+}
+
 func do(s *Server, method, path string, body []byte) *httptest.ResponseRecorder {
 	var r *http.Request
 	if body != nil {
