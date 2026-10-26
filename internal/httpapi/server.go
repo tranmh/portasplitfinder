@@ -5,6 +5,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -255,9 +256,18 @@ type subscribeRequest struct {
 	ProductID *string `json:"productId"`
 }
 
+// maxSubscribeBody caps the subscribe request body; a valid one is well under 1 KiB.
+const maxSubscribeBody = 64 << 10
+
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req subscribeRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxSubscribeBody)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, codeValidation, "request body too large", nil)
+			return
+		}
 		writeError(w, http.StatusBadRequest, codeValidation, "invalid JSON body", nil)
 		return
 	}
