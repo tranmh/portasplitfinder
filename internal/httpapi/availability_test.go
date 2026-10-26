@@ -1,11 +1,41 @@
 package httpapi
 
 import (
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/tranmh/portasplitfinder/internal/domain"
 	"github.com/tranmh/portasplitfinder/internal/geo"
 )
+
+// TestAssemble_ScalesLinearlyInStores: doubling stores (and with them the
+// snapshots) must not quadruple the work, as it does when every store scans
+// all snapshots.
+func TestAssemble_ScalesLinearlyInStores(t *testing.T) {
+	t.Skip("aqaa: open bug, see report")
+	measure := func(nStores int) time.Duration {
+		in := aqaaInputs(nStores, 10, nStores/2)
+		best := time.Duration(1<<63 - 1)
+		for i := 0; i < 3; i++ {
+			runtime.GC()
+			start := time.Now()
+			resp := assembleAvailability(in, nil, 0, "")
+			d := time.Since(start)
+			if len(resp.Stores) != nStores {
+				t.Fatalf("stores = %d, want %d", len(resp.Stores), nStores)
+			}
+			if d < best {
+				best = d
+			}
+		}
+		return best
+	}
+	small, large := measure(2000), measure(4000)
+	if ratio := float64(large) / float64(small); ratio > 3 {
+		t.Fatalf("2x stores took %.1fx the time (%v vs %v), want under 3x", ratio, large, small)
+	}
+}
 
 func sp(s string) *string { return &s }
 func ip(i int) *int       { return &i }
