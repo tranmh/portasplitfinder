@@ -133,12 +133,15 @@ func FormatPriceEUR(cents *int) string {
 	if cents == nil {
 		return "Preis unbekannt"
 	}
-	euros := *cents / 100
-	rem := *cents % 100
-	if rem < 0 {
-		rem = -rem
+	// Format the sign separately so amounts between -1 and -99 cents keep it,
+	// and use the uint64 magnitude so math.MinInt does not overflow.
+	sign := ""
+	mag := uint64(*cents)
+	if *cents < 0 {
+		sign = "-"
+		mag = -mag
 	}
-	return fmt.Sprintf("%d,%02d €", euros, rem)
+	return fmt.Sprintf("%s%d,%02d €", sign, mag/100, mag%100)
 }
 
 // BuildURL joins a base URL and a path query for confirm/unsub links.
