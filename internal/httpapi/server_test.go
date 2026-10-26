@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tranmh/portasplitfinder/internal/domain"
 	"github.com/tranmh/portasplitfinder/internal/notify"
@@ -79,6 +80,62 @@ func (f *fakeStore) UnsubSubscription(_ context.Context, token string) (bool, er
 func newTestServer(fs *fakeStore) (*Server, *notify.FakeMailer) {
 	m := notify.NewFakeMailer()
 	return New(Config{Store: fs, Mailer: m, PublicBaseURL: "http://localhost:8080"}), m
+}
+
+// fixtureTime is a fixed clock for fixtures; tests must not use time.Now.
+var fixtureTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+
+func ptr[T any](v T) *T { return &v }
+
+// storeFixture builds a store; mutate the result for variations.
+func storeFixture(id, name, city, plz string, lat, lon float64) domain.Store {
+	return domain.Store{ID: id, SourceKey: "obi", Name: name, PLZ: plz, City: city, Lat: lat, Lon: lon}
+}
+
+// snapFixture builds a snapshot. storeID "" means an online listing.
+func snapFixture(id, productID, storeID string, inStock bool) domain.AvailabilitySnapshot {
+	sn := domain.AvailabilitySnapshot{
+		ID: id, SourceKey: "obi", ProductID: productID, InStock: inStock,
+		Currency: "EUR", URL: "https://example.test/p/" + productID, CheckedAt: fixtureTime,
+	}
+	if storeID != "" {
+		sn.StoreID = ptr(storeID)
+	}
+	return sn
+}
+
+// seededFakeStore returns a fakeStore with a small, deterministic catalogue
+// around Esslingen (73035): three stores and listings for two products.
+func seededFakeStore() *fakeStore {
+	fs := newFakeStore()
+	fs.products = []domain.Product{{ID: "p1", Name: "Porta Split 1", Model: "PS1"}, {ID: "p2", Name: "Porta Split 2", Model: "PS2"}}
+	fs.stores = []domain.Store{
+		storeFixture("s1", "OBI Esslingen", "Esslingen", "73730", 48.74, 9.31),
+		storeFixture("s2", "OBI Stuttgart", "Stuttgart", "70173", 48.78, 9.18),
+		storeFixture("s3", "OBI Berlin", "Berlin", "10115", 52.53, 13.38),
+	}
+	fs.snaps = []domain.AvailabilitySnapshot{
+		snapFixture("a1", "p1", "s1", true),
+		snapFixture("a2", "p2", "s1", false),
+		snapFixture("a3", "p1", "s2", false),
+		snapFixture("a4", "p1", "s3", true),
+		snapFixture("a5", "p1", "", true),
+	}
+	return fs
+}
+
+func TestFixtures_SeededFakeStore(t *testing.T) {
+	fs := seededFakeStore()
+	ctx := context.Background()
+	got, err := fs.SearchStores(ctx, "esslingen")
+	if err != nil || len(got) != 1 || got[0].ID != "s1" {
+		t.Fatalf("SearchStores = %v, %v", got, err)
+	}
+	snaps, err := fs.LatestSnapshotsForStore(ctx, "s1")
+	if err != nil || len(snaps) != 2 {
+		t.Fatalf("LatestSnapshotsForStore = %v, %v", snaps, err)
+	}
+	var _ DataStore = fs
 }
 
 func TestHealth_OK(t *testing.T) {
