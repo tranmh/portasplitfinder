@@ -99,6 +99,14 @@ export const AvailabilityResponseSchema = z.object({
 });
 export type AvailabilityResponse = z.infer<typeof AvailabilityResponseSchema>;
 
+export const StoreSearchResponseSchema = z.object({
+  stores: z.array(StoreAvailabilitySchema),
+  total: z.number(),
+  page: z.number(),
+  pageSize: z.number(),
+});
+export type StoreSearchResponse = z.infer<typeof StoreSearchResponseSchema>;
+
 export const SubscriptionResponseSchema = z.object({
   status: z.literal("pending_confirmation"),
 });
@@ -201,6 +209,29 @@ export function getAvailability(
       plz: query.plz,
       radius: query.radius,
       productId: query.productId,
+    },
+  });
+}
+
+export interface StoreSearchQuery {
+  q?: string;
+  plz?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export function searchStores(
+  query: StoreSearchQuery = {},
+  signal?: AbortSignal,
+): Promise<StoreSearchResponse> {
+  return request(StoreSearchResponseSchema, "/api/stores", {
+    method: "GET",
+    signal,
+    params: {
+      q: query.q,
+      plz: query.plz,
+      page: query.page,
+      pageSize: query.pageSize,
     },
   });
 }

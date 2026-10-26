@@ -58,6 +58,32 @@ func (r *SnapshotRepo) Latest(ctx context.Context) ([]domain.AvailabilitySnapsho
 	return out, rows.Err()
 }
 
+// LatestForStore returns the latest snapshot per (source_key, product_id) at
+// one physical store.
+func (r *SnapshotRepo) LatestForStore(ctx context.Context, storeID string) ([]domain.AvailabilitySnapshot, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT ON (source_key, product_id)
+			id, source_key, store_id, product_id, in_stock, quantity, price_cents, currency, url, checked_at
+		FROM availability_snapshots
+		WHERE store_id = $1
+		ORDER BY source_key, product_id, checked_at DESC
+	`, storeID)
+	if err != nil {
+		return nil, fmt.Errorf("snapshots latest for store: %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.AvailabilitySnapshot
+	for rows.Next() {
+		var s domain.AvailabilitySnapshot
+		if err := rows.Scan(&s.ID, &s.SourceKey, &s.StoreID, &s.ProductID, &s.InStock, &s.Quantity, &s.PriceCents, &s.Currency, &s.URL, &s.CheckedAt); err != nil {
+			return nil, fmt.Errorf("snapshots scan: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // LatestForKey returns the most recent snapshot for one (source, store, product)
 // key, or ok=false if none exists. storeID may be empty for online listings.
 func (r *SnapshotRepo) LatestForKey(ctx context.Context, sourceKey, storeID, productID string) (domain.AvailabilitySnapshot, bool, error) {

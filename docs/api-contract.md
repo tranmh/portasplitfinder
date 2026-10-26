@@ -104,6 +104,34 @@ Response `200`:
 ```
 - `400` if `plz` is malformed or `radius` out of range.
 
+### GET /api/stores
+Search physical stores by name or city, with their current listings.
+
+Query params:
+- `q` (optional) — case-insensitive substring of the store name or city; empty
+  returns every store.
+- `plz` (optional, 5 digits) — when given, each store carries its distance and
+  results are ordered nearest first; otherwise ordered by city, name.
+- `page` (optional, integer, 1-based, default `1`).
+- `pageSize` (optional, integer, default `20`, range `1..100`).
+
+Response `200`:
+```jsonc
+{
+  "stores": [
+    {
+      "store": Store,
+      "distanceKm": number|null,   // null when no plz given
+      "listings": Listing[]        // latest listing per (source, product), in-stock first
+    }
+  ],
+  "total": 42,                     // number of matching stores across all pages
+  "page": 1,
+  "pageSize": 20
+}
+```
+- `400` if `plz` is malformed or `page`/`pageSize` out of range.
+
 ### POST /api/subscriptions
 Create a notification subscription. Sends a **double opt-in** confirmation email.
 

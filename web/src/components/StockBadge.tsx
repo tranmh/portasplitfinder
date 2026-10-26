@@ -9,7 +9,7 @@ export function StockBadge({ inStock, inStockLabel, outOfStockLabel }: StockBadg
     <span
       className={
         inStock
-          ? "inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-800"
+          ? "inline-flex items-center rounded-full bg-emerald-600 px-2 py-0.5 text-xs font-semibold text-white"
           : "inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600"
       }
     >

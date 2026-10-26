@@ -21,13 +21,22 @@ export const de = {
   },
 
   stores: {
-    heading: "Märkte in der Nähe",
+    heading: "Märkte in Ihrer Nähe",
     none: "Keine Märkte im gewählten Umkreis gefunden.",
     noCenter: "Geben Sie eine PLZ ein, um Märkte nach Entfernung zu sortieren.",
     distance: "Entfernung",
     inStock: "Auf Lager",
     outOfStock: "Nicht verfügbar",
     viewListing: "Zum Angebot",
+  },
+
+  storeSearch: {
+    heading: "Markt suchen",
+    placeholder: "Marktname oder Stadt",
+    noResults: "Keine passenden Märkte gefunden.",
+    results: "Treffer",
+    loadMore: "Weitere Märkte laden",
+    error: "Suche fehlgeschlagen. Bitte erneut versuchen.",
   },
 
   online: {

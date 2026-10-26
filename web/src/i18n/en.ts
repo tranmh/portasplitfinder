@@ -32,6 +32,15 @@ export const en: Messages = {
     viewListing: "View listing",
   },
 
+  storeSearch: {
+    heading: "Find a store",
+    placeholder: "Store name or city",
+    noResults: "No matching stores found.",
+    results: "results",
+    loadMore: "Load more stores",
+    error: "Search failed. Please try again.",
+  },
+
   online: {
     heading: "Online retailers",
     nationwide: "available nationwide",

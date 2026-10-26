@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/tranmh/portasplitfinder/internal/domain"
@@ -34,6 +35,24 @@ func (f *fakeStore) ListSources(context.Context) ([]domain.Source, error) { retu
 func (f *fakeStore) ListStores(context.Context) ([]domain.Store, error)   { return f.stores, nil }
 func (f *fakeStore) LatestSnapshots(context.Context) ([]domain.AvailabilitySnapshot, error) {
 	return f.snaps, nil
+}
+func (f *fakeStore) SearchStores(_ context.Context, q string) ([]domain.Store, error) {
+	var out []domain.Store
+	for _, st := range f.stores {
+		if q == "" || strings.Contains(strings.ToLower(st.Name+" "+st.City), strings.ToLower(q)) {
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) LatestSnapshotsForStore(_ context.Context, storeID string) ([]domain.AvailabilitySnapshot, error) {
+	var out []domain.AvailabilitySnapshot
+	for _, sn := range f.snaps {
+		if sn.StoreID != nil && *sn.StoreID == storeID {
+			out = append(out, sn)
+		}
+	}
+	return out, nil
 }
 func (f *fakeStore) CreateSubscription(_ context.Context, s domain.Subscription) (string, error) {
 	f.created++
@@ -182,6 +201,40 @@ func TestAvailability_OK(t *testing.T) {
 	}
 	if len(resp.Stores) != 1 || len(resp.Online) != 1 {
 		t.Errorf("stores=%d online=%d", len(resp.Stores), len(resp.Online))
+	}
+}
+
+func TestStoreSearch_ByCity(t *testing.T) {
+	fs := newFakeStore()
+	fs.stores = []domain.Store{
+		{ID: "s1", Name: "OBI Berlin-Spandau", PLZ: "13597", City: "Berlin", Lat: 52.53, Lon: 13.20},
+		{ID: "s2", Name: "OBI München", PLZ: "80331", City: "München", Lat: 48.14, Lon: 11.58},
+	}
+	fs.snaps = []domain.AvailabilitySnapshot{
+		{SourceKey: "mock", StoreID: sp("s1"), ProductID: "p1", InStock: true, Currency: "EUR"},
+	}
+	s, _ := newTestServer(fs)
+	rr := do(s, http.MethodGet, "/api/stores?q=berlin", nil)
+	if rr.Code != 200 {
+		t.Fatalf("status %d", rr.Code)
+	}
+	var resp StoreSearchResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Total != 1 || len(resp.Stores) != 1 || resp.Stores[0].Store.ID != "s1" {
+		t.Fatalf("unexpected result: %+v", resp)
+	}
+	if len(resp.Stores[0].Listings) != 1 {
+		t.Errorf("listings = %d, want 1", len(resp.Stores[0].Listings))
+	}
+}
+
+func TestStoreSearch_BadPageSize(t *testing.T) {
+	s, _ := newTestServer(newFakeStore())
+	rr := do(s, http.MethodGet, "/api/stores?pageSize=0", nil)
+	if rr.Code != 400 {
+		t.Fatalf("status %d, want 400", rr.Code)
 	}
 }
 
