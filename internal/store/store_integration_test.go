@@ -168,3 +168,36 @@ func TestIntegration_NotificationDedupe(t *testing.T) {
 		t.Fatalf("exists: %v %v", err, exists)
 	}
 }
+
+func TestIntegration_StoreSearchMatchesQueryLiterally(t *testing.T) {
+	db, cleanup := startPostgres(t)
+	defer cleanup()
+	ctx := context.Background()
+	seedBasics(t, db)
+	if _, err := db.Subscriptions.Create(ctx, domain.Subscription{Email: "secret@b.de", PLZ: "10115", RadiusKm: 50, ConfirmToken: "ct", UnsubToken: "ut"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A plain term still matches by name or city.
+	got, err := db.Stores.Search(ctx, "berlin")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("search berlin: %v %+v", err, got)
+	}
+
+	// SQL metacharacters in q are part of the search term, never SQL: no store
+	// is named or located in any of these, so nothing matches and nothing errors.
+	for _, q := range []string{
+		"O'Brien",
+		"' OR '1'='1",
+		"x' OR 1=1 OR name ILIKE '",
+		"zz' UNION SELECT id::text, 'mock', email, '', '', '', 0, 0 FROM subscriptions --",
+	} {
+		got, err := db.Stores.Search(ctx, q)
+		if err != nil {
+			t.Fatalf("search %q: unexpected error %v", q, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("search %q: expected no stores, got %+v", q, got)
+		}
+	}
+}
