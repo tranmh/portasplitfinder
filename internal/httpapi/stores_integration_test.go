@@ -401,9 +401,6 @@ func TestIntegrationStoreSearchQueryAndListings(t *testing.T) {
 	})
 
 	t.Run("quote in q is plain data", func(t *testing.T) {
-		// aqaa: suspected bug [B1, B2, B18] - StoreRepo.Search concatenates q
-		// into SQL; a quote turns the request into a 500 internal error.
-		t.Skip("aqaa: open bug, see report")
 		code, body, raw := getStores(t, ts, "q="+url.QueryEscape("o'brien"))
 		if code != http.StatusOK || body.Total != 0 {
 			t.Fatalf("status %d body %s", code, raw)
@@ -411,8 +408,6 @@ func TestIntegrationStoreSearchQueryAndListings(t *testing.T) {
 	})
 
 	t.Run("percent in q is literal", func(t *testing.T) {
-		// aqaa: suspected bug [B1] - % is not escaped and matches every store.
-		t.Skip("aqaa: open bug, see report")
 		code, body, raw := getStores(t, ts, "q="+url.QueryEscape("%"))
 		if code != http.StatusOK || body.Total != 0 {
 			t.Fatalf("status %d body %s", code, raw)
