@@ -387,7 +387,6 @@ func TestStoreSearch_Defaults(t *testing.T) {
 // TestStoreSearch_PageContainsPageSizeStores checks B8: page p holds
 // results[(p-1)*pageSize .. p*pageSize), with no store skipped between pages.
 func TestStoreSearch_PageContainsPageSizeStores(t *testing.T) {
-	t.Skip("aqaa: suspected bug: handleStoreSearch computes end as start+pageSize-1, so each page holds pageSize-1 stores and one store per page is skipped (B8); open bug, see report")
 	s, _ := newTestServer(seededFakeStore())
 	var seen []string
 	for _, page := range []string{"1", "2"} {
