@@ -18,6 +18,7 @@ const (
 	codeInvalidTok = "invalid_token"
 	codeNotFound   = "not_found"
 	codeInternal   = "internal"
+	codeRateLimit  = "rate_limited"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

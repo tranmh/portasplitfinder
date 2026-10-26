@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/tranmh/portasplitfinder/internal/domain"
@@ -141,6 +143,74 @@ func TestSubscribe_Confirm_Unsub_Flow(t *testing.T) {
 	rr = do(s, http.MethodGet, "/api/subscriptions/unsubscribe?token="+unsub, nil)
 	if rr.Code != 200 {
 		t.Fatalf("unsub status %d", rr.Code)
+	}
+}
+
+func TestSubscribe_ThrottlesRepeatedRequestsForSameEmail(t *testing.T) {
+	fs := newFakeStore()
+	s, mailer := newTestServer(fs)
+
+	const attempts = 50
+	const maxAllowed = 10
+	body := []byte(`{"email":"victim@example.com","plz":"73035"}`)
+	limited := 0
+	for i := 0; i < attempts; i++ {
+		rr := do(s, http.MethodPost, "/api/subscriptions", body)
+		switch rr.Code {
+		case http.StatusAccepted:
+		case http.StatusTooManyRequests:
+			limited++
+			var e apiError
+			_ = json.Unmarshal(rr.Body.Bytes(), &e)
+			if e.Error != "rate_limited" {
+				t.Errorf("attempt %d: error code %q, want rate_limited", i, e.Error)
+			}
+		default:
+			t.Fatalf("attempt %d: status %d, want 202 or 429", i, rr.Code)
+		}
+	}
+	if mailer.Count() > maxAllowed {
+		t.Errorf("sent %d confirm mails to the same address in a burst of %d, want at most %d", mailer.Count(), attempts, maxAllowed)
+	}
+	if fs.created > maxAllowed {
+		t.Errorf("stored %d subscription rows for the same address in a burst of %d, want at most %d", fs.created, attempts, maxAllowed)
+	}
+	t.Logf("429 responses: %d", limited)
+}
+
+// countingReader counts how many bytes the handler pulled from the body.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+func TestSubscribe_RejectsOversizedBodyWithoutBufferingIt(t *testing.T) {
+	fs := newFakeStore()
+	s, _ := newTestServer(fs)
+
+	const bodySize = 20 << 20
+	const maxRead = 1 << 20
+	huge := strings.Repeat("a", bodySize)
+	body := &countingReader{r: strings.NewReader(`{"email":"` + huge + `@b.de","plz":"10115"}`)}
+
+	r := httptest.NewRequest(http.MethodPost, "/api/subscriptions", body)
+	rr := httptest.NewRecorder()
+	s.Router().ServeHTTP(rr, r)
+
+	if rr.Code != http.StatusBadRequest && rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status %d, want 400 or 413", rr.Code)
+	}
+	if body.n > maxRead {
+		t.Errorf("handler read %d bytes of a %d byte body, want at most %d", body.n, bodySize, maxRead)
+	}
+	if fs.created != 0 {
+		t.Errorf("stored %d subscriptions, want 0", fs.created)
 	}
 }
 

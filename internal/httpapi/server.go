@@ -5,9 +5,12 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -38,6 +41,41 @@ type Server struct {
 	publicBaseURL string
 	webOrigin     string
 	log           *slog.Logger
+
+	// subMu guards subSeen: recent subscribe timestamps per (lowercased)
+	// email, used to cap confirmation mails sent to one address.
+	subMu   sync.Mutex
+	subSeen map[string][]time.Time
+}
+
+// Per-address subscribe throttle: at most subLimit requests per subWindow.
+const (
+	subLimit  = 3
+	subWindow = time.Hour
+)
+
+// allowSubscribe records a subscribe attempt for email and reports whether it
+// is within the per-address limit.
+func (s *Server) allowSubscribe(email string) bool {
+	key := strings.ToLower(strings.TrimSpace(email))
+	now := time.Now()
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	if s.subSeen == nil {
+		s.subSeen = map[string][]time.Time{}
+	}
+	recent := s.subSeen[key][:0]
+	for _, t := range s.subSeen[key] {
+		if now.Sub(t) < subWindow {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= subLimit {
+		s.subSeen[key] = recent
+		return false
+	}
+	s.subSeen[key] = append(recent, now)
+	return true
 }
 
 // Config configures the API server.
@@ -68,7 +106,7 @@ func New(cfg Config) *Server {
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
+	r.Use(middleware.ClientIPFromRemoteAddr)
 	r.Use(s.requestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(s.cors)
@@ -218,9 +256,18 @@ type subscribeRequest struct {
 	ProductID *string `json:"productId"`
 }
 
+// maxSubscribeBody caps the subscribe request body; a valid one is well under 1 KiB.
+const maxSubscribeBody = 64 << 10
+
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req subscribeRequest
+	r.Body = http.MaxBytesReader(w, r.Body, maxSubscribeBody)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, codeValidation, "request body too large", nil)
+			return
+		}
 		writeError(w, http.StatusBadRequest, codeValidation, "invalid JSON body", nil)
 		return
 	}
@@ -238,6 +285,10 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validRadius(radius) {
 		writeError(w, http.StatusBadRequest, codeValidation, "radiusKm must be in 1..500", fieldPtr("radiusKm"))
+		return
+	}
+	if !s.allowSubscribe(req.Email) {
+		writeError(w, http.StatusTooManyRequests, codeRateLimit, "too many subscription requests for this email", nil)
 		return
 	}
 
