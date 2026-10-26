@@ -71,7 +71,7 @@ func (s *Server) handleStoreSearch(w http.ResponseWriter, r *http.Request) {
 	if start > len(results) {
 		start = len(results)
 	}
-	end := start + pageSize - 1
+	end := start + pageSize
 	if end > len(results) {
 		end = len(results)
 	}
