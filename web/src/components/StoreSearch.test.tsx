@@ -340,8 +340,8 @@ describe("StoreSearch", () => {
       expect(screen.getByText(`1 ${t.results}`)).toBeInTheDocument();
     });
 
-    it.skip("aqaa: open bug, see report — load more keeps the submitted term (B21)", async () => {
-      // aqaa: suspected bug — load more reads the live input value instead of the
+    it("load more keeps the submitted term (B21)", async () => {
+      // aqaa: bug — load more reads the live input value instead of the
       // submitted search term, so editing the input without submitting and then
       // clicking load more appends page 2 of a different query (B21: "clicking
       // appends the next page" of the current search).
