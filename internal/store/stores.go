@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -50,16 +51,22 @@ func (r *StoreRepo) List(ctx context.Context) ([]domain.Store, error) {
 	return scanStores(rows)
 }
 
+// likeEscaper escapes the LIKE metacharacters (backslash is Postgres' default escape).
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 // Search returns the stores whose name or city contains q (case-insensitive),
 // ordered by city, name. An empty q returns every store.
 func (r *StoreRepo) Search(ctx context.Context, q string) ([]domain.Store, error) {
 	query := `SELECT id, source_key, name, street, plz, city, lat, lon FROM stores`
+	var args []any
 	if q != "" {
-		query += ` WHERE name ILIKE '%` + q + `%' OR city ILIKE '%` + q + `%'`
+		// q is bound, never spliced into the SQL; LIKE wildcards in it match literally.
+		query += ` WHERE name ILIKE '%' || $1 || '%' OR city ILIKE '%' || $1 || '%'`
+		args = append(args, likeEscaper.Replace(q))
 	}
 	query += ` ORDER BY city, name`
 
-	rows, err := r.pool.Query(ctx, query)
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("stores search: %w", err)
 	}
