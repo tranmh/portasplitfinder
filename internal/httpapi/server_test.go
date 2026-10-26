@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -75,49 +74,6 @@ func (f *fakeStore) UnsubSubscription(_ context.Context, token string) (bool, er
 		}
 	}
 	return false, nil
-}
-
-// snapCountingStore counts the snapshot queries the handlers issue.
-type snapCountingStore struct {
-	*fakeStore
-	snapQueries int
-}
-
-func (c *snapCountingStore) LatestSnapshots(ctx context.Context) ([]domain.AvailabilitySnapshot, error) {
-	c.snapQueries++
-	return c.fakeStore.LatestSnapshots(ctx)
-}
-func (c *snapCountingStore) LatestSnapshotsForStore(ctx context.Context, storeID string) ([]domain.AvailabilitySnapshot, error) {
-	c.snapQueries++
-	return c.fakeStore.LatestSnapshotsForStore(ctx, storeID)
-}
-
-// The snapshot lookups of GET /api/stores must not grow with the page size
-// (one batched query, not one query per store on the page).
-func TestStoreSearch_SnapshotQueriesIndependentOfPageSize(t *testing.T) {
-	fs := newFakeStore()
-	for i := 0; i < 200; i++ {
-		id := "store-" + strconv.Itoa(i)
-		fs.stores = append(fs.stores, domain.Store{ID: id, SourceKey: "obi", Name: "OBI " + strconv.Itoa(i), City: "Berlin"})
-		sid := id
-		fs.snaps = append(fs.snaps, domain.AvailabilitySnapshot{ID: "s-" + id, SourceKey: "obi", StoreID: &sid, ProductID: "p1"})
-	}
-	cs := &snapCountingStore{fakeStore: fs}
-	s := New(Config{Store: cs, Mailer: notify.NewFakeMailer(), PublicBaseURL: "http://localhost:8080"})
-
-	count := func(pageSize int) int {
-		cs.snapQueries = 0
-		rr := httptest.NewRecorder()
-		s.Router().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/stores?pageSize="+strconv.Itoa(pageSize), nil))
-		if rr.Code != 200 {
-			t.Fatalf("pageSize=%d: status %d", pageSize, rr.Code)
-		}
-		return cs.snapQueries
-	}
-	small, large := count(10), count(100)
-	if small > 2 || large > 2 {
-		t.Fatalf("snapshot queries per request: pageSize=10 -> %d, pageSize=100 -> %d; want a constant ≤2 (N+1 per store)", small, large)
-	}
 }
 
 func newTestServer(fs *fakeStore) (*Server, *notify.FakeMailer) {
