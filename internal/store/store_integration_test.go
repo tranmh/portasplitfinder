@@ -102,6 +102,78 @@ func TestIntegration_SnapshotLatestForKeyScalesWithHistory(t *testing.T) {
 	}
 }
 
+// latestRowsTouched returns how many availability_snapshots rows one Latest
+// call reads. repo's pool must hold a single connection (see
+// snapshotRowsTouched).
+func latestRowsTouched(t *testing.T, repo *SnapshotRepo, wantKeys int) int64 {
+	t.Helper()
+	ctx := context.Background()
+	read := func() int64 {
+		if _, err := repo.pool.Exec(ctx, `SELECT pg_stat_force_next_flush()`); err != nil {
+			t.Fatal(err)
+		}
+		var n int64
+		if err := repo.pool.QueryRow(ctx, `
+			SELECT coalesce(seq_tup_read,0) + coalesce(idx_tup_fetch,0)
+			FROM pg_stat_user_tables WHERE relname = 'availability_snapshots'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := read()
+	got, err := repo.Latest(ctx)
+	if err != nil || len(got) != wantKeys {
+		t.Fatalf("latest: %d rows, want %d, err=%v", len(got), wantKeys, err)
+	}
+	return read() - before
+}
+
+// Latest serves every GET /api/availability and returns one row per key, so
+// the rows it reads must not grow with the append-only snapshot history.
+func TestIntegration_SnapshotLatestScalesWithHistory(t *testing.T) {
+	db, cleanup := startPostgres(t)
+	defer cleanup()
+	ctx := context.Background()
+	pid, _ := seedBasics(t, db)
+
+	if _, err := db.Pool.Exec(ctx, `
+		INSERT INTO stores (source_key, name, plz, city, lat, lon)
+		SELECT 'mock', 'Store ' || g, '10115', 'Berlin', 52.5, 13.4 FROM generate_series(1, 199) g`); err != nil {
+		t.Fatal(err)
+	}
+	const keys = 200
+	addPolls := func(from, to int) {
+		if _, err := db.Pool.Exec(ctx, `
+			INSERT INTO availability_snapshots (source_key, store_id, product_id, in_stock, url, checked_at)
+			SELECT 'mock', s.id, $1, false, 'u', now() - make_interval(mins => p)
+			FROM stores s, generate_series($2::int, $3::int) p
+			WHERE s.source_key = 'mock'`, pid, from, to); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Pool.Exec(ctx, `ANALYZE availability_snapshots`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := db.Pool.Config()
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repo := &SnapshotRepo{pool: pool}
+
+	addPolls(1, 50)
+	n := latestRowsTouched(t, repo, keys)
+	addPolls(51, 100) // history doubles, keys stay the same
+	n2 := latestRowsTouched(t, repo, keys)
+
+	if 2*n2 > 3*n+2*keys {
+		t.Fatalf("Latest reads %d rows at N polls and %d at 2N for %d keys; want cost bounded by the keys, not a scan of the whole history", n, n2, keys)
+	}
+}
+
 func TestIntegration_ProductSourceStoreCRUD(t *testing.T) {
 	db, cleanup := startPostgres(t)
 	defer cleanup()
