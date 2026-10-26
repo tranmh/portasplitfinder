@@ -27,6 +27,16 @@ func (db *DB) ListStores(ctx context.Context) ([]domain.Store, error) {
 	return db.Stores.List(ctx)
 }
 
+// SearchStores implements httpapi.DataStore.
+func (db *DB) SearchStores(ctx context.Context, q string) ([]domain.Store, error) {
+	return db.Stores.Search(ctx, q)
+}
+
+// LatestSnapshotsForStore implements httpapi.DataStore.
+func (db *DB) LatestSnapshotsForStore(ctx context.Context, storeID string) ([]domain.AvailabilitySnapshot, error) {
+	return db.Snapshots.LatestForStore(ctx, storeID)
+}
+
 // LatestSnapshots implements httpapi.DataStore.
 func (db *DB) LatestSnapshots(ctx context.Context) ([]domain.AvailabilitySnapshot, error) {
 	return db.Snapshots.Latest(ctx)

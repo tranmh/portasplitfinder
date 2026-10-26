@@ -20,7 +20,7 @@ for the API spec.
 ## Frontend (`web/`, Next.js)
 
 - `web/src/app/` — App Router pages (`page.tsx`, `layout.tsx`) + `api/health` route for the container healthcheck.
-- `web/src/components/` — `MapView`/`MapPanel` (Leaflet, dynamic ssr:false), `PlzFilter`, `StoreList`, `OnlinePanel`, `SubscribeForm`, `StockBadge` (+ co-located `*.test.tsx`).
+- `web/src/components/` — `MapView`/`MapPanel` (Leaflet, dynamic ssr:false), `PlzFilter`, `StoreList`, `OnlinePanel`, `StoreSearch`, `SubscribeForm`, `StockBadge` (+ co-located `*.test.tsx`).
 - `web/src/hooks/` — `useAvailability` (refetch on plz/radius), `useDebouncedValue`.
 - `web/src/lib/` — `api-client.ts` (typed fetchers + Zod schemas mirroring the contract), `format.ts`.
 - `web/src/i18n/` — `de` (default) + `en` message dictionaries.

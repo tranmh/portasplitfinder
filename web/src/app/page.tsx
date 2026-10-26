@@ -7,6 +7,7 @@ import { PlzFilter, type PlzFilterValue } from "@/components/PlzFilter";
 import { MapPanel } from "@/components/MapPanel";
 import { OnlinePanel } from "@/components/OnlinePanel";
 import { StoreList } from "@/components/StoreList";
+import { StoreSearch } from "@/components/StoreSearch";
 import { SubscribeForm } from "@/components/SubscribeForm";
 import { formatDateTime } from "@/lib/format";
 
@@ -63,6 +64,8 @@ export default function HomePage() {
             />
             {messages.filter.inStockOnly}
           </label>
+
+          <StoreSearch messages={messages} plz={plz} />
 
           {error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 p-4">

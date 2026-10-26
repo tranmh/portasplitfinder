@@ -18,7 +18,7 @@ type Center struct {
 // StoreAvailability groups a physical store with its listings and distance.
 type StoreAvailability struct {
 	Store      domain.Store     `json:"store"`
-	DistanceKm *float64         `json:"distanceKm"`
+	DistanceKm *float64         `json:"distanceKm,omitempty"`
 	Listings   []domain.Listing `json:"listings"`
 }
 
@@ -52,68 +52,35 @@ type availabilityInputs struct {
 //   - center is nil when no plz was given (distances are null, no radius filter).
 //   - productID, when non-empty, restricts to that product.
 func assembleAvailability(in availabilityInputs, center *Center, radiusKm int, productID string) AvailabilityResponse {
-	storeByID := make(map[string]domain.Store, len(in.stores))
-	for _, s := range in.stores {
-		storeByID[s.ID] = s
-	}
 	sourceByKey := make(map[string]domain.Source, len(in.sources))
 	for _, s := range in.sources {
 		sourceByKey[s.Key] = s
 	}
 
-	// Group listings: store listings keyed by store id; online keyed by source.
-	storeListings := map[string][]domain.Listing{}
-	onlineListings := map[string][]domain.Listing{}
+	// Physical stores: one entry per store that has at least one listing.
+	var stores []StoreAvailability
+	for _, st := range in.stores {
+		entry := storeEntry(st, in.snapshots, center, productID)
+		if len(entry.Listings) == 0 {
+			continue
+		}
+		if entry.DistanceKm != nil && radiusKm > 0 && *entry.DistanceKm > float64(radiusKm) {
+			continue // outside radius
+		}
+		stores = append(stores, entry)
+	}
+	sortStoreEntries(stores)
 
+	// Online listings are keyed by source.
+	onlineListings := map[string][]domain.Listing{}
 	for _, snap := range in.snapshots {
 		if productID != "" && snap.ProductID != productID {
 			continue
 		}
-		l := snapshotToListing(snap)
-		if snap.StoreID != nil && *snap.StoreID != "" {
-			storeListings[*snap.StoreID] = append(storeListings[*snap.StoreID], l)
-		} else {
-			onlineListings[snap.SourceKey] = append(onlineListings[snap.SourceKey], l)
+		if snap.StoreID == nil || *snap.StoreID == "" {
+			onlineListings[snap.SourceKey] = append(onlineListings[snap.SourceKey], snapshotToListing(snap))
 		}
 	}
-
-	// Build store availability entries.
-	var stores []StoreAvailability
-	for id, listings := range storeListings {
-		st, ok := storeByID[id]
-		if !ok {
-			continue // orphaned listing; skip
-		}
-		var dist *float64
-		if center != nil {
-			d := geo.DistanceKm(geo.Point{Lat: center.Lat, Lon: center.Lon}, geo.Point{Lat: st.Lat, Lon: st.Lon})
-			if radiusKm > 0 && d > float64(radiusKm) {
-				continue // outside radius
-			}
-			dd := d
-			dist = &dd
-		}
-		sortListings(listings)
-		stores = append(stores, StoreAvailability{Store: st, DistanceKm: dist, Listings: listings})
-	}
-
-	// Sort stores: nearest first when distances known, else by name.
-	sort.SliceStable(stores, func(i, j int) bool {
-		a, b := stores[i], stores[j]
-		switch {
-		case a.DistanceKm != nil && b.DistanceKm != nil:
-			if *a.DistanceKm != *b.DistanceKm {
-				return *a.DistanceKm < *b.DistanceKm
-			}
-			return a.Store.Name < b.Store.Name
-		case a.DistanceKm != nil:
-			return true
-		case b.DistanceKm != nil:
-			return false
-		default:
-			return a.Store.Name < b.Store.Name
-		}
-	})
 
 	// Build online availability entries, sorted by source key for stability.
 	var online []OnlineAvailability
@@ -139,6 +106,51 @@ func assembleAvailability(in availabilityInputs, center *Center, radiusKm int, p
 		Online:      online,
 		GeneratedAt: time.Now().UTC(),
 	}
+}
+
+// storeEntry builds the availability entry for one store from the given
+// snapshots: its listings (optionally restricted to productID, in-stock first)
+// and, when center is set, its distance from the center.
+func storeEntry(st domain.Store, snaps []domain.AvailabilitySnapshot, center *Center, productID string) StoreAvailability {
+	listings := []domain.Listing{}
+	for _, snap := range snaps {
+		if snap.StoreID == nil || *snap.StoreID != st.ID {
+			continue
+		}
+		if productID != "" && snap.ProductID != productID {
+			continue
+		}
+		listings = append(listings, snapshotToListing(snap))
+	}
+	sortListings(listings)
+
+	var dist *float64
+	if center != nil {
+		d := geo.DistanceKm(geo.Point{Lat: center.Lat, Lon: center.Lon}, geo.Point{Lat: st.Lat, Lon: st.Lon})
+		dist = &d
+	}
+	return StoreAvailability{Store: st, DistanceKm: dist, Listings: listings}
+}
+
+// sortStoreEntries orders stores nearest first when distances are known, else
+// by name.
+func sortStoreEntries(stores []StoreAvailability) {
+	sort.SliceStable(stores, func(i, j int) bool {
+		a, b := stores[i], stores[j]
+		switch {
+		case a.DistanceKm != nil && b.DistanceKm != nil:
+			if *a.DistanceKm != *b.DistanceKm {
+				return *a.DistanceKm < *b.DistanceKm
+			}
+			return a.Store.Name < b.Store.Name
+		case a.DistanceKm != nil:
+			return true
+		case b.DistanceKm != nil:
+			return false
+		default:
+			return a.Store.Name < b.Store.Name
+		}
+	})
 }
 
 // sortListings puts in-stock first, then by price ascending (nil price last),

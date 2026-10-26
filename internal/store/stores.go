@@ -50,6 +50,23 @@ func (r *StoreRepo) List(ctx context.Context) ([]domain.Store, error) {
 	return scanStores(rows)
 }
 
+// Search returns the stores whose name or city contains q (case-insensitive),
+// ordered by city, name. An empty q returns every store.
+func (r *StoreRepo) Search(ctx context.Context, q string) ([]domain.Store, error) {
+	query := `SELECT id, source_key, name, street, plz, city, lat, lon FROM stores`
+	if q != "" {
+		query += ` WHERE name ILIKE '%` + q + `%' OR city ILIKE '%` + q + `%'`
+	}
+	query += ` ORDER BY city, name`
+
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("stores search: %w", err)
+	}
+	defer rows.Close()
+	return scanStores(rows)
+}
+
 // Get returns a single store by id.
 func (r *StoreRepo) Get(ctx context.Context, id string) (domain.Store, bool, error) {
 	var s domain.Store
