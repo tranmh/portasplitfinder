@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -38,6 +40,53 @@ type Server struct {
 	publicBaseURL string
 	webOrigin     string
 	log           *slog.Logger
+	subLimit      *emailLimiter
+}
+
+// Subscribe throttling: at most subscribeMaxPerEmail accepted requests per
+// address within subscribeWindow (the endpoint is unauthenticated and every
+// accepted request sends a mail).
+const (
+	subscribeMaxPerEmail = 3
+	subscribeWindow      = time.Hour
+)
+
+// emailLimiter is an in-memory sliding-window limiter keyed by email address.
+type emailLimiter struct {
+	mu     sync.Mutex
+	max    int
+	window time.Duration
+	hits   map[string][]time.Time
+}
+
+func newEmailLimiter(limit int, window time.Duration) *emailLimiter {
+	return &emailLimiter{max: limit, window: window, hits: map[string][]time.Time{}}
+}
+
+// allow records a hit for key and reports whether it is within the limit.
+func (l *emailLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	cutoff := now.Add(-l.window)
+	if len(l.hits) > 10000 {
+		for k, ts := range l.hits {
+			if len(ts) == 0 || !ts[len(ts)-1].After(cutoff) {
+				delete(l.hits, k)
+			}
+		}
+	}
+	recent := l.hits[key][:0]
+	for _, t := range l.hits[key] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= l.max {
+		l.hits[key] = recent
+		return false
+	}
+	l.hits[key] = append(recent, now)
+	return true
 }
 
 // Config configures the API server.
@@ -61,6 +110,7 @@ func New(cfg Config) *Server {
 		publicBaseURL: cfg.PublicBaseURL,
 		webOrigin:     cfg.WebOrigin,
 		log:           log,
+		subLimit:      newEmailLimiter(subscribeMaxPerEmail, subscribeWindow),
 	}
 }
 
@@ -238,6 +288,10 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validRadius(radius) {
 		writeError(w, http.StatusBadRequest, codeValidation, "radiusKm must be in 1..500", fieldPtr("radiusKm"))
+		return
+	}
+	if !s.subLimit.allow(strings.ToLower(req.Email), time.Now()) {
+		writeError(w, http.StatusTooManyRequests, codeRateLimited, "too many subscription requests for this email", nil)
 		return
 	}
 

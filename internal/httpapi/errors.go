@@ -14,10 +14,11 @@ type apiError struct {
 
 // Common machine codes per the contract.
 const (
-	codeValidation = "validation_error"
-	codeInvalidTok = "invalid_token"
-	codeNotFound   = "not_found"
-	codeInternal   = "internal"
+	codeValidation  = "validation_error"
+	codeInvalidTok  = "invalid_token"
+	codeNotFound    = "not_found"
+	codeRateLimited = "rate_limited"
+	codeInternal    = "internal"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
