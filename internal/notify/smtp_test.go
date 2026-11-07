@@ -396,10 +396,42 @@ func TestSMTPMailer_Send_SubjectHeaderInjection(t *testing.T) {
 		t.Fatalf("parse: %v", perr)
 	}
 	if bcc := parsed.Header.Get("Bcc"); bcc != "" {
-		// aqaa: suspected bug: buildMIME/encodeHeader write an ASCII Subject
-		// verbatim, so CR/LF in it injects extra headers such as Bcc.
-		t.Skip("aqaa: open bug, see report")
+		// buildMIME/encodeHeader write an ASCII Subject verbatim, so CR/LF in
+		// it injects extra headers such as Bcc.
 		t.Fatalf("subject injected a Bcc header: %q", bcc)
+	}
+}
+
+// A pure ASCII subject longer than 75 characters must survive intact, and any
+// RFC 2047 encoded-word used for it must stay within the 75 character limit.
+func TestSMTPMailer_Send_LongASCIISubject(t *testing.T) {
+	srv := startFakeSMTP(t, false, false)
+	m := NewSMTPMailer(SMTPConfig{Host: "127.0.0.1", Port: srv.port(), From: "noreply@psf.example"})
+	msg := testMessage()
+	msg.Subject = "PortaSplitFinder: your subscription for 73035 within 50 km is now confirmed, thanks"
+	if len(msg.Subject) <= 75 {
+		t.Fatalf("test subject must be longer than 75 characters, is %d", len(msg.Subject))
+	}
+	if err := m.Send(msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	mails, _ := srv.received()
+	if len(mails) != 1 {
+		t.Fatalf("got %d mails", len(mails))
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(mails[0].data))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	raw := parsed.Header.Get("Subject")
+	for _, w := range strings.Fields(raw) {
+		if strings.HasPrefix(w, "=?") && strings.HasSuffix(w, "?=") && len(w) > 75 {
+			t.Fatalf("encoded-word longer than 75 characters (%d): %q", len(w), w)
+		}
+	}
+	dec, err := new(mime.WordDecoder).DecodeHeader(raw)
+	if err != nil || dec != msg.Subject {
+		t.Fatalf("decoded subject = %q (%v), want %q", dec, err, msg.Subject)
 	}
 }
 
