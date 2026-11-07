@@ -144,6 +144,49 @@ func TestSubscribe_Confirm_Unsub_Flow(t *testing.T) {
 	}
 }
 
+// Repeated subscribe requests for one address must be throttled: the endpoint
+// is unauthenticated and every accepted request stores a row and sends a mail.
+func TestSubscribe_ThrottlesRepeatedRequestsForSameEmail(t *testing.T) {
+	const attempts = 100
+	const maxAccepted = 10 // generous bound; any sane per-address limit is far below
+	fs := newFakeStore()
+	s, mailer := newTestServer(fs)
+
+	body := []byte(`{"email":"victim@example.org","plz":"73035"}`)
+	accepted, limited := 0, 0
+	for i := 0; i < attempts; i++ {
+		rr := do(s, http.MethodPost, "/api/subscriptions", body)
+		switch rr.Code {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusTooManyRequests:
+			limited++
+			var e apiError
+			if err := json.Unmarshal(rr.Body.Bytes(), &e); err != nil {
+				t.Fatalf("429 body not JSON: %v", err)
+			}
+			if e.Error != "rate_limited" {
+				t.Fatalf("429 error code %q, want rate_limited", e.Error)
+			}
+		default:
+			t.Fatalf("request %d: unexpected status %d", i, rr.Code)
+		}
+	}
+
+	if limited == 0 {
+		t.Errorf("%d subscribe requests for one email: none answered 429 rate_limited", attempts)
+	}
+	if accepted > maxAccepted {
+		t.Errorf("accepted %d of %d requests for one email, want at most %d", accepted, attempts, maxAccepted)
+	}
+	if n := mailer.Count(); n > maxAccepted {
+		t.Errorf("sent %d confirmation mails to one address, want at most %d", n, maxAccepted)
+	}
+	if fs.created > maxAccepted {
+		t.Errorf("created %d subscription rows for one email, want at most %d", fs.created, maxAccepted)
+	}
+}
+
 func TestAvailability_BadPLZ(t *testing.T) {
 	s, _ := newTestServer(newFakeStore())
 	rr := do(s, http.MethodGet, "/api/availability?plz=abc", nil)
