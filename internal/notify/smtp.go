@@ -126,10 +126,11 @@ func buildMIME(from string, msg Message) []byte {
 	return []byte(b.String())
 }
 
-// encodeHeader RFC2047-encodes a header value if it contains non-ASCII.
+// encodeHeader RFC2047-encodes a header value if it contains non-ASCII or
+// control characters, so CR/LF cannot start a new header line.
 func encodeHeader(s string) string {
 	for _, r := range s {
-		if r > 127 {
+		if r > 126 || (r < ' ' && r != '\t') {
 			return mimeEncode(s)
 		}
 	}

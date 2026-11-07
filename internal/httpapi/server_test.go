@@ -101,6 +101,38 @@ func TestSubscribe_Validation(t *testing.T) {
 	}
 }
 
+// A productId that is not a UUID must be rejected as a validation error before
+// it reaches the store (where the ::uuid cast would fail with a 500).
+func TestSubscribe_RejectsMalformedProductID(t *testing.T) {
+	cases := []string{
+		`{"email":"a@b.de","plz":"73035","productId":"not-a-uuid"}`,
+		`{"email":"a@b.de","plz":"73035","productId":"' OR 1=1 --"}`,
+		`{"email":"a@b.de","plz":"73035","productId":"00000000-0000-0000-0000-00000000000g"}`,
+	}
+	for _, body := range cases {
+		fs := newFakeStore()
+		s, mailer := newTestServer(fs)
+		rr := do(s, http.MethodPost, "/api/subscriptions", []byte(body))
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status %d, want 400", body, rr.Code)
+		}
+		var e apiError
+		_ = json.Unmarshal(rr.Body.Bytes(), &e)
+		if e.Error != codeValidation {
+			t.Errorf("body %s: error code %q, want %q", body, e.Error, codeValidation)
+		}
+		if e.Field == nil || *e.Field != "productId" {
+			t.Errorf("body %s: field %v, want productId", body, e.Field)
+		}
+		if fs.created != 0 {
+			t.Errorf("body %s: created %d subscriptions, want 0", body, fs.created)
+		}
+		if mailer.Count() != 0 {
+			t.Errorf("body %s: sent %d mails, want 0", body, mailer.Count())
+		}
+	}
+}
+
 func TestSubscribe_Confirm_Unsub_Flow(t *testing.T) {
 	fs := newFakeStore()
 	s, mailer := newTestServer(fs)
@@ -141,6 +173,49 @@ func TestSubscribe_Confirm_Unsub_Flow(t *testing.T) {
 	rr = do(s, http.MethodGet, "/api/subscriptions/unsubscribe?token="+unsub, nil)
 	if rr.Code != 200 {
 		t.Fatalf("unsub status %d", rr.Code)
+	}
+}
+
+// Repeated subscribe requests for one address must be throttled: the endpoint
+// is unauthenticated and every accepted request stores a row and sends a mail.
+func TestSubscribe_ThrottlesRepeatedRequestsForSameEmail(t *testing.T) {
+	const attempts = 100
+	const maxAccepted = 10 // generous bound; any sane per-address limit is far below
+	fs := newFakeStore()
+	s, mailer := newTestServer(fs)
+
+	body := []byte(`{"email":"victim@example.org","plz":"73035"}`)
+	accepted, limited := 0, 0
+	for i := 0; i < attempts; i++ {
+		rr := do(s, http.MethodPost, "/api/subscriptions", body)
+		switch rr.Code {
+		case http.StatusAccepted:
+			accepted++
+		case http.StatusTooManyRequests:
+			limited++
+			var e apiError
+			if err := json.Unmarshal(rr.Body.Bytes(), &e); err != nil {
+				t.Fatalf("429 body not JSON: %v", err)
+			}
+			if e.Error != "rate_limited" {
+				t.Fatalf("429 error code %q, want rate_limited", e.Error)
+			}
+		default:
+			t.Fatalf("request %d: unexpected status %d", i, rr.Code)
+		}
+	}
+
+	if limited == 0 {
+		t.Errorf("%d subscribe requests for one email: none answered 429 rate_limited", attempts)
+	}
+	if accepted > maxAccepted {
+		t.Errorf("accepted %d of %d requests for one email, want at most %d", accepted, attempts, maxAccepted)
+	}
+	if n := mailer.Count(); n > maxAccepted {
+		t.Errorf("sent %d confirmation mails to one address, want at most %d", n, maxAccepted)
+	}
+	if fs.created > maxAccepted {
+		t.Errorf("created %d subscription rows for one email, want at most %d", fs.created, maxAccepted)
 	}
 }
 
