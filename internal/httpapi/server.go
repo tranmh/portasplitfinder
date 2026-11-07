@@ -290,6 +290,21 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeValidation, "radiusKm must be in 1..500", fieldPtr("radiusKm"))
 		return
 	}
+	if req.ProductID != nil && *req.ProductID != "" {
+		if !validUUID(*req.ProductID) {
+			writeError(w, http.StatusBadRequest, codeValidation, "productId must be a UUID", fieldPtr("productId"))
+			return
+		}
+		known, err := s.productExists(r.Context(), *req.ProductID)
+		if err != nil {
+			s.internal(w, err)
+			return
+		}
+		if !known {
+			writeError(w, http.StatusBadRequest, codeValidation, "unknown productId", fieldPtr("productId"))
+			return
+		}
+	}
 	if !s.subLimit.allow(strings.ToLower(req.Email), time.Now()) {
 		writeError(w, http.StatusTooManyRequests, codeRateLimited, "too many subscription requests for this email", nil)
 		return
@@ -335,6 +350,20 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "pending_confirmation"})
+}
+
+// productExists reports whether id names a tracked product.
+func (s *Server) productExists(ctx context.Context, id string) (bool, error) {
+	products, err := s.store.ListProducts(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range products {
+		if strings.EqualFold(p.ID, id) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
