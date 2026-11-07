@@ -101,6 +101,38 @@ func TestSubscribe_Validation(t *testing.T) {
 	}
 }
 
+// A productId that is not a UUID must be rejected as a validation error before
+// it reaches the store (where the ::uuid cast would fail with a 500).
+func TestSubscribe_RejectsMalformedProductID(t *testing.T) {
+	cases := []string{
+		`{"email":"a@b.de","plz":"73035","productId":"not-a-uuid"}`,
+		`{"email":"a@b.de","plz":"73035","productId":"' OR 1=1 --"}`,
+		`{"email":"a@b.de","plz":"73035","productId":"00000000-0000-0000-0000-00000000000g"}`,
+	}
+	for _, body := range cases {
+		fs := newFakeStore()
+		s, mailer := newTestServer(fs)
+		rr := do(s, http.MethodPost, "/api/subscriptions", []byte(body))
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status %d, want 400", body, rr.Code)
+		}
+		var e apiError
+		_ = json.Unmarshal(rr.Body.Bytes(), &e)
+		if e.Error != codeValidation {
+			t.Errorf("body %s: error code %q, want %q", body, e.Error, codeValidation)
+		}
+		if e.Field == nil || *e.Field != "productId" {
+			t.Errorf("body %s: field %v, want productId", body, e.Field)
+		}
+		if fs.created != 0 {
+			t.Errorf("body %s: created %d subscriptions, want 0", body, fs.created)
+		}
+		if mailer.Count() != 0 {
+			t.Errorf("body %s: sent %d mails, want 0", body, mailer.Count())
+		}
+	}
+}
+
 func TestSubscribe_Confirm_Unsub_Flow(t *testing.T) {
 	fs := newFakeStore()
 	s, mailer := newTestServer(fs)
